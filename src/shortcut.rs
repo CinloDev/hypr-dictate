@@ -30,15 +30,25 @@ pub fn apply(shortcut: &str, old: &str) -> Result<()> {
                 .as_array()
                 .context("Lista de atajos inválida")?
                 .iter()
-                .any(|b| b["modmask"].as_i64() == Some(mask)
-                    && b["key"]
-                        .as_str()
-                        .is_some_and(|k| k.eq_ignore_ascii_case(key))),
+                .any(|b| {
+                    if b["modmask"].as_i64() != Some(mask)
+                        || !b["key"].as_str().is_some_and(|k| k.eq_ignore_ascii_case(key))
+                    {
+                        return false;
+                    }
+                    // Descartar si el binding pertenece a hypr-dictate
+                    let is_own = b["arg"].as_str().is_some_and(|a| a.contains("hypr-dictate"))
+                        || b["command"].as_str().is_some_and(|c| c.contains("hypr-dictate"))
+                        || b["description"]
+                            .as_str()
+                            .is_some_and(|d| d.contains("hypr-dictate"));
+                    !is_own
+                }),
             "Ese atajo ya está ocupado en Hyprland"
         );
     }
     let path = std::path::PathBuf::from(std::env::var_os("HOME").context("Falta HOME")?)
-        .join(".config/hypr/keybinds.lua");
+        .join(".config/hypr/bindings.lua");
     for p in path.ancestors() {
         ensure!(
             !std::fs::symlink_metadata(p)?.file_type().is_symlink(),
@@ -79,87 +89,4 @@ pub fn apply(shortcut: &str, old: &str) -> Result<()> {
         anyhow::bail!("Hyprland rechazó el cambio; se restauró el archivo anterior");
     }
     Ok(())
-}
-
-pub fn shortcut_held(shortcut: &str) -> Option<bool> {
-    if shortcut.is_empty() {
-        return None;
-    }
-    let mut groups: Vec<&[u16]> = Vec::new();
-    for token in shortcut.split('+').map(str::trim) {
-        groups.push(match token {
-            "SUPER" => &[125, 126],
-            "CTRL" => &[29, 97],
-            "ALT" => &[56, 100],
-            "SHIFT" => &[42, 54],
-            "D" => &[32],
-            "F9" => &[67],
-            "F10" => &[68],
-            _ => return None,
-        });
-    }
-    let mut combined = [0u8; 96];
-    let mut readable = false;
-    for entry in std::fs::read_dir("/dev/input").ok()?.flatten() {
-        let name = entry.file_name();
-        if !name.to_string_lossy().starts_with("event") {
-            continue;
-        }
-        if let Ok(file) = std::fs::File::open(entry.path()) {
-            let mut bits = [0u8; 96];
-            // EVIOCGKEY(96): _IOR('E', 0x18, [u8; 96]) = 0x80604518
-            let rc = unsafe {
-                libc::ioctl(
-                    std::os::fd::AsRawFd::as_raw_fd(&file),
-                    0x80604518u64 as _,
-                    bits.as_mut_ptr(),
-                )
-            };
-            if rc >= 0 {
-                readable = true;
-                for (dst, src) in combined.iter_mut().zip(bits) {
-                    *dst |= src;
-                }
-            }
-        }
-    }
-    if !readable {
-        return None;
-    }
-    Some(groups.into_iter().all(|group| {
-        group
-            .iter()
-            .any(|code| (combined[(*code as usize) / 8] & (1 << ((*code as usize) % 8))) != 0)
-    }))
-}
-
-pub fn any_modifier_held() -> bool {
-    let mut combined = [0u8; 96];
-    let Ok(entries) = std::fs::read_dir("/dev/input") else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().starts_with("event") {
-            continue;
-        }
-        if let Ok(file) = std::fs::File::open(entry.path()) {
-            let mut bits = [0u8; 96];
-            let rc = unsafe {
-                libc::ioctl(
-                    std::os::fd::AsRawFd::as_raw_fd(&file),
-                    0x80604518u64 as _,
-                    bits.as_mut_ptr(),
-                )
-            };
-            if rc >= 0 {
-                for (dst, src) in combined.iter_mut().zip(bits) {
-                    *dst |= src;
-                }
-            }
-        }
-    }
-    // CTRL(29,97), SHIFT(42,54), ALT(56,100), SUPER(125,126)
-    [29usize, 97, 42, 54, 56, 100, 125, 126]
-        .into_iter()
-        .any(|code| (combined[code / 8] & (1 << (code % 8))) != 0)
 }

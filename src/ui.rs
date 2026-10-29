@@ -1,7 +1,6 @@
 use crate::{App, Event, paint::Modal};
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::BTreeMap,
     io::{Seek, SeekFrom, Write},
     os::fd::AsFd,
     sync::mpsc,
@@ -28,8 +27,9 @@ pub struct OutputItem {
     pub output: wl_output::WlOutput,
 }
 
-const SHORTCUTS: [&str; 6] = [
+const SHORTCUTS: [&str; 7] = [
     "",
+    "SUPER + ALT + V",
     "CTRL + SHIFT + D",
     "CTRL + ALT + D",
     "SUPER + SHIFT + D",
@@ -39,6 +39,7 @@ const SHORTCUTS: [&str; 6] = [
 
 pub struct Ui {
     connection: Connection,
+    qh: QueueHandle<Self>,
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     seat: Option<wl_seat::WlSeat>,
@@ -51,6 +52,14 @@ pub struct Ui {
     modal_layer: Option<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1>,
     pointer: Option<wl_pointer::WlPointer>,
     tx: mpsc::Sender<Event>,
+    pub capturing_keyboard: bool,
+    pub arm_token: u64,
+    pub seen_enter: bool,
+    pub seen_modifiers: bool,
+    pub pressed_keys: std::collections::BTreeSet<u32>,
+    pub mods_depressed: u32,
+    pub arming: bool,
+    pub arm_target: Option<(u64, String, bool, std::time::Instant)>,
     configured: bool,
     modal_configured: bool,
     closed: bool,
@@ -184,6 +193,10 @@ impl Ui {
         Ok(())
     }
     fn toggle_modal(&mut self, qh: &QueueHandle<Self>) {
+        if self.capturing_keyboard {
+            return;
+        }
+        self.capture_keyboard(false);
         if self.panel {
             self.panel = false;
             self.open_select = None;
@@ -343,6 +356,121 @@ impl Ui {
         self.surface = Some(surface);
         self.layer = Some(layer);
         self.dirty = true;
+    }
+    pub fn close_modal(&mut self) {
+        if self.panel {
+            self.panel = false;
+            self.open_select = None;
+            self.prompt_focused = false;
+            if let Some(layer) = self.modal_layer.take() {
+                layer.destroy();
+            }
+            if let Some(surface) = self.modal_surface.take() {
+                surface.destroy();
+            }
+            self.modal_configured = false;
+            self.dirty = true;
+            let _ = self.connection.flush();
+        }
+    }
+    pub fn is_visible(&self) -> bool {
+        self.layer.is_some()
+    }
+    pub fn arm(&mut self, address: String, dock_was_hidden: bool) {
+        self.arm_token = self.arm_token.wrapping_add(1);
+        self.seen_enter = false;
+        self.seen_modifiers = false;
+        self.pressed_keys.clear();
+        self.mods_depressed = 0;
+        self.arming = true;
+        self.arm_target = Some((
+            self.arm_token,
+            address,
+            dock_was_hidden,
+            std::time::Instant::now(),
+        ));
+        self.capture_keyboard(true);
+    }
+    pub fn check_arm_ready(&mut self) {
+        if self.arming
+            && self.seen_enter
+            && self.seen_modifiers
+            && self.mods_depressed == 0
+            && self.pressed_keys.is_empty()
+        {
+            self.arming = false;
+            if let Some((token, address, dock_was_hidden, _)) = self.arm_target.take() {
+                let _ = self.tx.send(Event::ArmReady(token, address, dock_was_hidden));
+            }
+        }
+    }
+    pub fn cancel_arm(&mut self) {
+        if self.arming {
+            self.arm_token = self.arm_token.wrapping_add(1);
+            self.arming = false;
+            self.seen_enter = false;
+            self.seen_modifiers = false;
+            self.capture_keyboard(false);
+            if let Some((_, address, dock_was_hidden, _)) = self.arm_target.take() {
+                let _ = crate::restore(&address);
+                if dock_was_hidden {
+                    self.hide();
+                }
+            }
+            self.message = "Atajo cancelado".into();
+            self.dirty = true;
+        }
+    }
+    pub fn capture_keyboard(&mut self, capture: bool) {
+        self.capturing_keyboard = capture;
+        if let Some(layer) = &self.layer {
+            let interactivity = if capture {
+                KeyboardInteractivity::Exclusive
+            } else {
+                KeyboardInteractivity::None
+            };
+            layer.set_keyboard_interactivity(interactivity);
+            if let Some(surface) = &self.surface {
+                surface.commit();
+            }
+            let _ = self.connection.flush();
+        }
+    }
+    pub fn hide(&mut self) {
+        self.capture_keyboard(false);
+        if self.panel {
+            self.toggle_modal(&self.qh.clone());
+        } else if let Some(layer) = self.modal_layer.take() {
+            layer.destroy();
+            if let Some(surface) = self.modal_surface.take() {
+                surface.destroy();
+            }
+            self.modal_configured = false;
+        }
+        if let Some(layer) = self.layer.take() {
+            layer.destroy();
+        }
+        if let Some(surface) = self.surface.take() {
+            surface.destroy();
+        }
+        self.configured = false;
+        self.dirty = false;
+        self.press = None;
+        self.dragged = false;
+        let _ = self.connection.flush();
+    }
+    pub fn show(&mut self) {
+        if self.layer.is_none() {
+            self.setup_dock(&self.qh.clone());
+            let _ = self.connection.flush();
+        }
+    }
+    pub fn toggle_visibility(&mut self) {
+        if self.is_visible() {
+            self.hide();
+        } else {
+            self.show();
+        }
     }
     fn choose_monitor(&mut self, step: isize, qh: &QueueHandle<Self>) {
         let len = self.monitors.len() + 1;
@@ -513,63 +641,63 @@ impl Ui {
         }
     }
     pub fn type_text(&mut self, text: &str, address: &str) -> Result<()> {
-        let cleaned = hypr_dictate::sanitize_plain_text(text);
-        if cleaned.is_empty() {
+        let chunks = hypr_dictate::plan_chunks(text);
+        if chunks.is_empty() {
             return Ok(());
         }
         // Wait for physical modifiers (CTRL/ALT/SHIFT/SUPER) to be released so the target app
         // never sees Ctrl+key or Alt+key combinations while typing.
         for _ in 0..100 {
-            if !crate::shortcut::any_modifier_held() {
+            if self.mods_depressed == 0 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(15));
         }
-        let keyboard = self.keyboard.as_ref().unwrap();
-        let all_chars: Vec<char> = cleaned.chars().collect();
-        let mut cursor = 0;
-        while cursor < all_chars.len() {
+
+        let manager = self.manager.as_ref().context("Falta virtual keyboard manager")?;
+        let seat = self.seat.as_ref().context("Falta seat Wayland")?;
+
+        for chunk in chunks {
             ensure!(
                 crate::active_address()? == address,
                 "Cambió el foco durante la inserción; inserción detenida"
             );
-            let mut map = BTreeMap::new();
-            let mut names = String::new();
-            let mut symbols = String::new();
-            let mut end = cursor;
-            while end < all_chars.len() {
-                let ch = all_chars[end];
-                if !map.contains_key(&ch) {
-                    if map.len() == hypr_dictate::SAFE_EVDEV_KEYS.len() {
-                        break;
-                    }
-                    let slot = map.len();
-                    let evdev = hypr_dictate::SAFE_EVDEV_KEYS[slot];
-                    let xkb = evdev + 8;
-                    map.insert(ch, evdev);
-                    names.push_str(&format!("<K{slot}> = {xkb};\n"));
-                    symbols.push_str(&format!("key <K{slot}> {{ [ U{:04X} ] }};\n", ch as u32));
+
+            // Crear un dispositivo de teclado virtual dedicado por chunk.
+            // Esto asegura que el compositor (Hyprland) asigne y transmita un nuevo
+            // descriptor de keymap a la superficie enfocada para cada bloque,
+            // evitando que clientes Wayland retengan el mapa de teclas anterior.
+            let keyboard = manager.create_virtual_keyboard(seat, &self.qh, ());
+
+            let chunk_result = (|| -> Result<()> {
+                let mut file = tempfile::tempfile()?;
+                file.write_all(chunk.keymap.as_bytes())?;
+                file.seek(SeekFrom::Start(0))?;
+                keyboard.keymap(1, file.as_fd(), chunk.keymap.len() as u32);
+                keyboard.modifiers(0, 0, 0, 0);
+                self.connection.flush()?;
+                std::thread::sleep(Duration::from_millis(6));
+
+                for code in chunk.keycodes {
+                    ensure!(
+                        crate::active_address()? == address,
+                        "Cambió el foco durante la inserción; inserción detenida"
+                    );
+                    keyboard.key(0, code, 1);
+                    keyboard.key(0, code, 0);
                 }
-                end += 1;
-            }
-            let keymap = format!(
-                "xkb_keymap {{ xkb_keycodes \"dictate\" {{ minimum = 8; maximum = 255; {names} }}; xkb_types \"dictate\" {{ type \"ONE_LEVEL\" {{ modifiers = None; level_name[Level1] = \"Any\"; }}; }}; xkb_compatibility \"dictate\" {{}}; xkb_symbols \"dictate\" {{ {symbols} }}; }};\0"
-            );
-            let mut file = tempfile::tempfile()?;
-            file.write_all(keymap.as_bytes())?;
-            file.seek(SeekFrom::Start(0))?;
-            keyboard.keymap(1, file.as_fd(), keymap.len() as u32);
+                self.connection.flush()?;
+                std::thread::sleep(Duration::from_millis(8));
+                Ok(())
+            })();
+
+            // Limpieza incondicional ante cualquier error o salida anticipada
             keyboard.modifiers(0, 0, 0, 0);
-            self.connection.flush()?;
-            std::thread::sleep(Duration::from_millis(6));
-            for ch in &all_chars[cursor..end] {
-                let code = map[ch];
-                keyboard.key(0, code, 1);
-                keyboard.key(0, code, 0);
-            }
-            self.connection.flush()?;
-            std::thread::sleep(Duration::from_millis(8));
-            cursor = end;
+            keyboard.destroy();
+            let _ = self.connection.flush();
+            std::thread::sleep(Duration::from_millis(2));
+
+            chunk_result?;
         }
         Ok(())
     }
@@ -662,6 +790,24 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Ui {
                     state.xkb_state = Some(xkb::State::new(&keymap));
                 }
             }
+            wl_keyboard::Event::Enter { surface, keys, .. } => {
+                if state.surface.as_ref() == Some(&surface) {
+                    state.seen_enter = true;
+                    state.pressed_keys.clear();
+                    for chunk in keys.as_chunks::<4>().0 {
+                        state.pressed_keys.insert(u32::from_ne_bytes(*chunk));
+                    }
+                    state.check_arm_ready();
+                }
+            }
+            wl_keyboard::Event::Leave { surface, .. } => {
+                if state.surface.as_ref() == Some(&surface) {
+                    state.pressed_keys.clear();
+                    state.mods_depressed = 0;
+                    state.seen_enter = false;
+                    state.seen_modifiers = false;
+                }
+            }
             wl_keyboard::Event::Modifiers {
                 mods_depressed,
                 mods_latched,
@@ -669,8 +815,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Ui {
                 group,
                 ..
             } => {
+                state.mods_depressed = mods_depressed;
                 if let Some(xkb_state) = &mut state.xkb_state {
                     xkb_state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
+                }
+                if state.seen_enter {
+                    state.seen_modifiers = true;
+                    state.check_arm_ready();
                 }
             }
             wl_keyboard::Event::Key {
@@ -776,6 +927,50 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Ui {
                     }
                 }
             }
+            wl_keyboard::Event::Key {
+                key,
+                state: Value(keystate),
+                ..
+            } if state.capturing_keyboard && !state.panel => {
+                match keystate {
+                    wl_keyboard::KeyState::Pressed => {
+                        state.pressed_keys.insert(key);
+                    }
+                    wl_keyboard::KeyState::Released => {
+                        state.pressed_keys.remove(&key);
+                    }
+                    _ => {}
+                }
+                if state.arming {
+                    let xkb_key = xkb::Keycode::new(key + 8);
+                    let sym = state.xkb_state.as_ref().map(|s| s.key_get_one_sym(xkb_key));
+                    if sym == Some(xkb::Keysym::Escape) && keystate == wl_keyboard::KeyState::Pressed {
+                        state.cancel_arm();
+                        return;
+                    }
+                    state.check_arm_ready();
+                    return;
+                }
+                let xkb_key = xkb::Keycode::new(key + 8);
+                let sym = state.xkb_state.as_ref().map(|s| s.key_get_one_sym(xkb_key));
+                let capture_key = match sym {
+                    Some(xkb::Keysym::Return) => Some(hypr_dictate::CaptureKey::Return),
+                    Some(xkb::Keysym::KP_Enter) => Some(hypr_dictate::CaptureKey::KpEnter),
+                    Some(xkb::Keysym::Escape) => Some(hypr_dictate::CaptureKey::Escape),
+                    _ => None,
+                };
+                if let Some(ck) = capture_key {
+                    match keystate {
+                        wl_keyboard::KeyState::Pressed => {
+                            let _ = state.tx.send(Event::KeyPress(ck));
+                        }
+                        wl_keyboard::KeyState::Released => {
+                            let _ = state.tx.send(Event::KeyRelease(ck));
+                        }
+                        _ => {}
+                    }
+                }
+            }
             _ => {}
         }
         if state.dirty && let Err(error) = state.draw(qh) {
@@ -864,7 +1059,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for Ui {
                 button: 273,
                 state: Value(wl_pointer::ButtonState::Pressed),
                 ..
-            } => state.toggle_modal(qh),
+            } => {
+                if !state.capturing_keyboard {
+                    state.toggle_modal(qh);
+                }
+            }
             wl_pointer::Event::Button {
                 button: 272,
                 state: Value(wl_pointer::ButtonState::Pressed),
@@ -907,8 +1106,13 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for Ui {
     ) {
         match event {
             zwlr_layer_surface_v1::Event::Configure { serial, .. } => {
+                let is_modal = state.modal_layer.as_ref() == Some(layer);
+                let is_dock = state.layer.as_ref() == Some(layer);
+                if !is_modal && !is_dock {
+                    return;
+                }
                 layer.ack_configure(serial);
-                if state.modal_layer.as_ref() == Some(layer) {
+                if is_modal {
                     state.modal_configured = true;
                 } else {
                     state.configured = true;
@@ -922,7 +1126,7 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for Ui {
             zwlr_layer_surface_v1::Event::Closed => {
                 if state.modal_layer.as_ref() == Some(layer) {
                     state.toggle_modal(qh);
-                } else {
+                } else if state.layer.as_ref() == Some(layer) {
                     state.closed = true;
                 }
             }
@@ -986,6 +1190,7 @@ pub fn run(mut app: App, rx: mpsc::Receiver<Event>) -> Result<()> {
     let monitors = crate::settings::monitors();
     let mut ui = Ui {
         connection: connection.clone(),
+        qh: qh.clone(),
         compositor: None,
         shm: None,
         seat: None,
@@ -998,6 +1203,14 @@ pub fn run(mut app: App, rx: mpsc::Receiver<Event>) -> Result<()> {
         modal_layer: None,
         pointer: None,
         tx: app.tx.clone(),
+        capturing_keyboard: false,
+        arm_token: 0,
+        seen_enter: false,
+        seen_modifiers: false,
+        pressed_keys: std::collections::BTreeSet::new(),
+        mods_depressed: 0,
+        arming: false,
+        arm_target: None,
         configured: false,
         modal_configured: false,
         closed: false,
@@ -1065,8 +1278,11 @@ pub fn run(mut app: App, rx: mpsc::Receiver<Event>) -> Result<()> {
         queue.dispatch_pending(&mut ui)?;
         while let Ok(event) = rx.try_recv() {
             app.event(event, &mut ui);
-            ui.dirty = true;
+            if ui.is_visible() {
+                ui.dirty = true;
+            }
         }
+        app.tick(&mut ui);
         let color = app.color();
         let active = matches!(
             app.phase,
@@ -1123,4 +1339,122 @@ pub fn run(mut app: App, rx: mpsc::Receiver<Event>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requiere receptor Wayland dedicado: HYPR_DICTATE_TEST_ADDRESS y HYPR_DICTATE_TEST_TITLE"]
+    fn test_type_text_into_isolated_receiver() {
+        let address = std::env::var("HYPR_DICTATE_TEST_ADDRESS")
+            .expect("HYPR_DICTATE_TEST_ADDRESS ausente");
+        let address = address.trim();
+        assert!(!address.is_empty(), "HYPR_DICTATE_TEST_ADDRESS vacío");
+
+        let expected_title = std::env::var("HYPR_DICTATE_TEST_TITLE")
+            .expect("HYPR_DICTATE_TEST_TITLE ausente");
+        let expected_title = expected_title.trim();
+        assert!(!expected_title.is_empty(), "HYPR_DICTATE_TEST_TITLE vacío");
+
+        // Validar destino existente y título exacto contra Hyprland
+        let clients_bytes = crate::hypr(&["-j", "clients"]).expect("hyprctl clients");
+        let clients: serde_json::Value =
+            serde_json::from_slice(&clients_bytes).expect("JSON clients válido");
+        let client = clients
+            .as_array()
+            .and_then(|arr| arr.iter().find(|c| c["address"] == address))
+            .expect("Ventana de prueba no encontrada en Hyprland");
+
+        let actual_title = client["title"].as_str().unwrap_or("");
+        assert_eq!(
+            actual_title, expected_title,
+            "El título de la ventana no coincide con el receptor esperado"
+        );
+
+        // Validar foco activo
+        let active_bytes = crate::hypr(&["-j", "activewindow"]).expect("hyprctl activewindow");
+        let active: serde_json::Value =
+            serde_json::from_slice(&active_bytes).expect("JSON activewindow válido");
+        assert_eq!(
+            active["address"].as_str().unwrap_or(""),
+            address,
+            "La ventana receptora debe tener el foco activo antes de iniciar el test"
+        );
+
+        let connection = Connection::connect_to_env().expect("Conexión Wayland");
+        let mut queue = connection.new_event_queue();
+        let qh = queue.handle();
+        let (tx, _rx) = mpsc::channel();
+        let mut ui = Ui {
+            connection: connection.clone(),
+            qh: qh.clone(),
+            compositor: None,
+            shm: None,
+            seat: None,
+            shell: None,
+            manager: None,
+            keyboard: None,
+            surface: None,
+            layer: None,
+            modal_surface: None,
+            modal_layer: None,
+            pointer: None,
+            tx,
+            capturing_keyboard: false,
+            arm_token: 0,
+            seen_enter: false,
+            seen_modifiers: false,
+            pressed_keys: std::collections::BTreeSet::new(),
+            mods_depressed: 0,
+            arming: false,
+            arm_target: None,
+            configured: false,
+            modal_configured: false,
+            closed: false,
+            color: [0, 0, 0],
+            models: Vec::new(),
+            message: String::new(),
+            draft: crate::settings::Settings::load().unwrap_or_default(),
+            panel: false,
+            open_select: None,
+            in_modal: false,
+            pointer_xy: (0., 0.),
+            press: None,
+            dragged: false,
+            tick: 0.,
+            open_progress: 0.,
+            level: 0.,
+            account_index: 0,
+            model_index: 0,
+            shortcut_index: 0,
+            microphones: Vec::new(),
+            microphone_index: 0,
+            monitors: Vec::new(),
+            outputs: Vec::new(),
+            monitor_index: 0,
+            buffers: 0,
+            dirty: false,
+            max_x: 1280,
+            tab: 0,
+            prompt_cursor: 0,
+            prompt_focused: false,
+            seat_keyboard: None,
+            xkb_context: xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+            xkb_state: None,
+        };
+        connection.display().get_registry(&qh, ());
+        queue.roundtrip(&mut ui).unwrap();
+        queue.roundtrip(&mut ui).unwrap();
+        if let (Some(manager), Some(seat)) = (&ui.manager, &ui.seat) {
+            ui.keyboard = Some(manager.create_virtual_keyboard(seat, &qh, ()));
+        } else {
+            panic!("El compositor no ofrece zwp_virtual_keyboard_manager_v1 o wl_seat");
+        }
+        queue.roundtrip(&mut ui).unwrap();
+
+        let phrase = "Genial, funciona muy bien. Está perfecto, así que bueno, esto es una transcripción de prueba.";
+        ui.type_text(phrase, address).expect("Ui::type_text original completó sin error");
+    }
 }

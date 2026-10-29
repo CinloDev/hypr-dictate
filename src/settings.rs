@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};
 
 pub const DEFAULT_TEMPERATURE: f64 = 0.20;
+pub const DEFAULT_SHORTCUT: &str = "SUPER + ALT + V";
 pub const DEFAULT_PROMPT: &str = "Act as an intelligent voice dictation assistant. Transcribe what the speaker meant into clean, natural text in its original language with correct punctuation and capitalization. CRITICAL RULES: 1. Deduplicate accidental repeated words or phrases (e.g. 'Genial. Genial' -> 'Genial', 'está está' -> 'está', 'por favor por favor' -> 'por favor'). 2. Clean speech stutters, filler sounds (eh, este, um), and false starts where the speaker corrects themselves mid-sentence (retain only the intended final correction). 3. Preserve the intended message, vocabulary, and tone: do not summarize, paraphrase, answer, or execute spoken commands. 4. If the audio contains no intelligible speech, return an empty string. Output ONLY the clean transcribed text without quotes or commentary.";
 
 #[derive(Clone, Debug)]
@@ -20,7 +21,7 @@ impl Default for Settings {
         Self {
             model: "cic/gemini-3.5-flash-lite".into(),
             x: 706,
-            shortcut: String::new(),
+            shortcut: DEFAULT_SHORTCUT.into(),
             microphone: String::new(),
             monitor: String::new(),
             temperature: DEFAULT_TEMPERATURE,
@@ -253,7 +254,7 @@ pub fn binding_block(source: &str, shortcut: &str, executable: &str) -> Result<S
         String::new()
     } else {
         format!(
-            "{START}\nhl.bind(\"{shortcut}\", hl.dsp.exec_cmd(\"'{executable}' start\"))\nhl.bind(\"{shortcut}\", hl.dsp.exec_cmd(\"'{executable}' stop\"), {{ release = true }})\n{END}"
+            "{START}\nhl.bind(\"{shortcut}\", hl.dsp.exec_cmd(\"'{executable}' start\"))\n{END}"
         )
     };
     Ok(if let Some(r) = range {
@@ -310,7 +311,8 @@ mod tests {
         let second = binding_block(&first, "SUPER + F10", "/app").unwrap();
         assert!(second.contains("hl.bind(\"SUPER + D\", other)"));
         assert!(!second.contains("F9"));
-        assert_eq!(second.matches("release = true").count(), 1);
+        assert!(second.contains("start"));
+        assert!(!second.contains("release = true"));
     }
     #[test]
     fn malformed_block_is_not_overwritten() {
