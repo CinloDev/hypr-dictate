@@ -430,7 +430,7 @@ fn main() -> Result<()> {
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
         key,
-        endpoint: "http://192.168.0.100:8317/v1/chat/completions".into(),
+        endpoint: "http://127.0.0.1:8317/v1/chat/completions".into(),
         settings: settings::Settings::load()?,
         level: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         error: String::new(),
@@ -441,7 +441,7 @@ fn main() -> Result<()> {
     thread::spawn(move || {
         let result = (|| -> Result<Vec<String>> {
             let response = catalog_client
-                .get("http://192.168.0.100:8317/v1/models?client_version=1")
+                .get("http://127.0.0.1:8317/v1/models?client_version=1")
                 .bearer_auth(catalog_key)
                 .send()?
                 .error_for_status()?;
