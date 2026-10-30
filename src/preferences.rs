@@ -8,11 +8,28 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::mpsc::Sender,
+    sync::{Once, mpsc::Sender},
 };
 
 pub const PREFERENCES_PANEL_WIDTH: i32 = 420;
 pub const PREFERENCES_NAMESPACE: &str = "hypr-dictate-preferences";
+pub const PREFERENCES_CSS: &str = include_str!("preferences.css");
+
+static INIT_CSS: Once = Once::new();
+
+fn ensure_css_provider() {
+    INIT_CSS.call_once(|| {
+        if let Some(display) = gtk::gdk::Display::default() {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_data(PREFERENCES_CSS);
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    });
+}
 
 fn find_gtk_monitor(connector: &str) -> Option<gtk::gdk::Monitor> {
     if connector.is_empty() {
@@ -148,6 +165,7 @@ impl Preferences {
         tx: Sender<Event>,
     ) -> Result<Self> {
         gtk::init()?;
+        ensure_css_provider();
         let app = application()?;
         let window = gtk::ApplicationWindow::builder()
             .application(&app)
@@ -751,6 +769,47 @@ mod tests {
         assert_eq!(PREFERENCES_PANEL_WIDTH, 420);
         assert_eq!(PREFERENCES_NAMESPACE, "hypr-dictate-preferences");
         assert!(find_gtk_monitor("").is_none());
+    }
+
+    #[test]
+    fn preferences_css_contains_machete_palette_and_scoped_classes() {
+        assert!(PREFERENCES_CSS.contains("#1A1218"));
+        assert!(PREFERENCES_CSS.contains("#EF94C7"));
+        assert!(PREFERENCES_CSS.contains("#FFB1DD"));
+        assert!(PREFERENCES_CSS.contains("#A78E9B"));
+        assert!(PREFERENCES_CSS.contains("#5C2C74"));
+        assert!(PREFERENCES_CSS.contains("JetBrainsMono Nerd Font"));
+        assert!(PREFERENCES_CSS.contains(".hypr-dictate-preferences"));
+        assert!(PREFERENCES_CSS.contains(".hypr-dictate-popover"));
+        assert!(PREFERENCES_CSS.contains(".preferences-outer"));
+        assert!(PREFERENCES_CSS.contains(".preferences-panel"));
+        assert!(PREFERENCES_CSS.contains("border: 2px solid #EF94C7;"));
+        assert!(PREFERENCES_CSS.contains("padding: 10px 0px 10px 10px;"));
+        assert!(PREFERENCES_CSS.contains(".hypr-dictate-preferences spinbutton button + button"));
+        assert!(PREFERENCES_CSS.contains("margin-left: 4px;"));
+    }
+
+    #[test]
+    fn preferences_css_parses_without_gtk_parsing_errors() {
+        if gtk::init().is_err() {
+            return;
+        }
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let errors_clone = errors.clone();
+        let provider = gtk::CssProvider::new();
+        provider.connect_parsing_error(move |_provider, section, error| {
+            errors_clone
+                .lock()
+                .unwrap()
+                .push(format!("{section}: {error}"));
+        });
+        provider.load_from_data(PREFERENCES_CSS);
+        let captured = errors.lock().unwrap().clone();
+        assert!(
+            captured.is_empty(),
+            "GTK CSS parsing errors encountered: {:?}",
+            captured
+        );
     }
 
     #[test]

@@ -1,0 +1,387 @@
+/* Hypr Dictate — Estilo Cute Keybindings (referencia keybindings-machete)
+ * Scoped bajo .hypr-dictate-preferences y popovers con .hypr-dictate-popover
+ * Paleta Cinlodev CUTE:
+ *   Fondo: #1A1218
+ *   Texto: #F6EFF3
+ *   Acentos / bordes: #EF94C7
+ *   Títulos / hover: #FFB1DD
+ *   Secundarios / tenues: #A78E9B
+ *   Scrollbar slider: #5C2C74 -> #EF94C7 (hover)
+ *   Trough: rgba(20, 10, 40, 0.4)
+ */
+
+window.hypr-dictate-preferences,
+.hypr-dictate-preferences {
+    font-family: "JetBrainsMono Nerd Font", monospace;
+    color: #F6EFF3;
+    background-color: transparent;
+}
+
+window.hypr-dictate-preferences {
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+}
+
+/* Contenedor exterior transparente para margen visual Machete */
+.hypr-dictate-preferences .preferences-outer {
+    background-color: transparent;
+    padding: 10px 0px 10px 10px;
+}
+
+/* Panel interior con borde rosa completo 4 lados y esquinas rectas estilo Machete */
+.hypr-dictate-preferences .preferences-panel {
+    background-color: #1A1218;
+    border: 2px solid #EF94C7;
+    border-radius: 0px;
+    padding: 14px 12px;
+    box-shadow: 0 0 16px rgba(239, 148, 199, 0.25);
+}
+
+/* Header bar integrado dentro del panel */
+.hypr-dictate-preferences headerbar,
+.hypr-dictate-preferences .preferences-header {
+    background-color: #1A1218;
+    border-bottom: 1px solid rgba(142, 68, 173, 0.35);
+    border-top: none;
+    border-left: none;
+    border-right: none;
+    box-shadow: none;
+    padding: 0 0 8px 0;
+    margin-bottom: 8px;
+}
+
+.hypr-dictate-preferences headerbar .title,
+.hypr-dictate-preferences .header-title {
+    color: #FFB1DD;
+    font-size: 15px;
+    font-weight: bold;
+}
+
+/* Headings y textos secundarios */
+.hypr-dictate-preferences label.heading,
+.hypr-dictate-preferences .heading {
+    color: #FFB1DD;
+    font-weight: bold;
+}
+
+.hypr-dictate-preferences label.dim-label,
+.hypr-dictate-preferences .dim-label {
+    color: #A78E9B;
+    font-size: 11px;
+}
+
+.hypr-dictate-preferences label {
+    color: #F6EFF3;
+}
+
+/* Stack switcher (tabs) estilo keybindings-tab */
+.hypr-dictate-preferences stackswitcher {
+    border-radius: 10px;
+    background-color: transparent;
+    padding: 0;
+}
+
+.hypr-dictate-preferences stackswitcher > button {
+    font-size: 11px;
+    font-weight: bold;
+    letter-spacing: 0.5px;
+    color: #A78E9B;
+    background-color: transparent;
+    background-image: none;
+    box-shadow: none;
+    text-shadow: none;
+    border: 1px solid rgba(239, 148, 199, 0.4);
+    border-radius: 10px;
+    padding: 4px 12px;
+    margin: 0 3px;
+    min-height: 24px;
+}
+
+.hypr-dictate-preferences stackswitcher > button label {
+    color: inherit;
+}
+
+.hypr-dictate-preferences stackswitcher > button:hover {
+    color: #FFB1DD;
+    border-color: #EF94C7;
+}
+
+.hypr-dictate-preferences stackswitcher > button:hover label {
+    color: #FFB1DD;
+}
+
+.hypr-dictate-preferences stackswitcher > button:checked,
+.hypr-dictate-preferences stackswitcher > button.active {
+    color: #1A1218;
+    background-color: #EF94C7;
+    background-image: none;
+    box-shadow: 0 0 8px rgba(239, 148, 199, 0.45);
+    border-color: #EF94C7;
+}
+
+.hypr-dictate-preferences stackswitcher > button:checked label,
+.hypr-dictate-preferences stackswitcher > button.active label {
+    color: #1A1218;
+}
+
+/* Botones estándar / oscuros / acciones */
+.hypr-dictate-preferences button {
+    font-family: "JetBrainsMono Nerd Font", monospace;
+    font-size: 12px;
+    color: #F6EFF3;
+    background-color: #241A22;
+    background-image: none;
+    border: 1px solid rgba(239, 148, 199, 0.4);
+    border-radius: 6px;
+    padding: 6px 14px;
+    box-shadow: none;
+    text-shadow: none;
+}
+
+.hypr-dictate-preferences button label {
+    color: inherit;
+}
+
+.hypr-dictate-preferences button:hover {
+    color: #FFB1DD;
+    border-color: #EF94C7;
+    background-color: #2E222C;
+}
+
+.hypr-dictate-preferences button:hover label {
+    color: #FFB1DD;
+}
+
+.hypr-dictate-preferences button:active {
+    background-color: #382936;
+}
+
+/* Botón guardar / acción sugerida (rosa vibrante Machete) */
+.hypr-dictate-preferences button.suggested-action {
+    color: #1A1218;
+    background-color: #EF94C7;
+    border-color: #EF94C7;
+    font-weight: bold;
+    box-shadow: 0 0 8px rgba(239, 148, 199, 0.35);
+}
+
+.hypr-dictate-preferences button.suggested-action label {
+    color: #1A1218;
+    font-weight: bold;
+}
+
+.hypr-dictate-preferences button.suggested-action:hover {
+    color: #1A1218;
+    background-color: #FFB1DD;
+    border-color: #FFB1DD;
+    box-shadow: 0 0 12px rgba(239, 148, 199, 0.5);
+}
+
+.hypr-dictate-preferences button.suggested-action:hover label {
+    color: #1A1218;
+}
+
+/* Entradas de texto, spinbuttons y dropdowns */
+.hypr-dictate-preferences entry,
+.hypr-dictate-preferences spinbutton {
+    font-family: "JetBrainsMono Nerd Font", monospace;
+    color: #F6EFF3;
+    background-color: #241A22;
+    border: 1px solid rgba(239, 148, 199, 0.4);
+    border-radius: 6px;
+    padding: 6px 10px;
+    box-shadow: none;
+}
+
+.hypr-dictate-preferences entry:focus-within,
+.hypr-dictate-preferences spinbutton:focus-within {
+    border-color: #EF94C7;
+    box-shadow: 0 0 6px rgba(239, 148, 199, 0.35);
+}
+
+.hypr-dictate-preferences entry text,
+.hypr-dictate-preferences spinbutton text {
+    color: #F6EFF3;
+}
+
+.hypr-dictate-preferences spinbutton button + button {
+    margin-left: 4px;
+}
+
+.hypr-dictate-preferences textview,
+.hypr-dictate-preferences textview text {
+    font-family: "JetBrainsMono Nerd Font", monospace;
+    color: #F6EFF3;
+    background-color: #241A22;
+}
+
+.hypr-dictate-preferences scrolledwindow.frame {
+    border: 1px solid rgba(239, 148, 199, 0.4);
+    border-radius: 6px;
+}
+
+.hypr-dictate-preferences dropdown > button {
+    background-color: #241A22;
+    border: 1px solid rgba(239, 148, 199, 0.4);
+    border-radius: 6px;
+    color: #F6EFF3;
+    padding: 6px 10px;
+}
+
+.hypr-dictate-preferences dropdown > button:hover {
+    border-color: #EF94C7;
+    color: #FFB1DD;
+}
+
+/* Popover scoped para dropdowns de preferencias */
+popover.hypr-dictate-popover,
+.hypr-dictate-preferences dropdown popover {
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+}
+
+popover.hypr-dictate-popover > arrow,
+.hypr-dictate-preferences dropdown popover > arrow {
+    background-color: transparent;
+    border: none;
+}
+
+popover.hypr-dictate-popover > contents,
+.hypr-dictate-popover contents,
+.hypr-dictate-preferences dropdown popover > contents {
+    font-family: "JetBrainsMono Nerd Font", monospace;
+    background-color: #1A1218;
+    color: #F6EFF3;
+    border: 1px solid #EF94C7;
+    border-radius: 6px;
+    box-shadow: 0 0 12px rgba(239, 148, 199, 0.25);
+    padding: 4px;
+}
+
+/* Scrolledwindow, viewport y listview transparentes para eliminar la isla gris de Adwaita */
+.hypr-dictate-popover scrolledwindow,
+.hypr-dictate-popover scrolledwindow > viewport,
+.hypr-dictate-popover listview,
+.hypr-dictate-preferences dropdown popover scrolledwindow,
+.hypr-dictate-preferences dropdown popover scrolledwindow > viewport,
+.hypr-dictate-preferences dropdown popover listview {
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    margin: 0;
+    padding: 0;
+}
+
+/* Filas de la lista del dropdown */
+.hypr-dictate-popover listview row,
+.hypr-dictate-preferences dropdown popover listview row {
+    color: #F6EFF3;
+    background-color: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 10px;
+}
+
+.hypr-dictate-popover listview row label,
+.hypr-dictate-preferences dropdown popover listview row label {
+    color: #F6EFF3;
+}
+
+.hypr-dictate-popover listview row:hover,
+.hypr-dictate-popover listview row:selected,
+.hypr-dictate-preferences dropdown popover listview row:hover,
+.hypr-dictate-preferences dropdown popover listview row:selected {
+    background-color: #2E222C;
+    color: #FFB1DD;
+}
+
+.hypr-dictate-popover listview row:hover label,
+.hypr-dictate-popover listview row:selected label,
+.hypr-dictate-preferences dropdown popover listview row:hover label,
+.hypr-dictate-preferences dropdown popover listview row:selected label {
+    color: #FFB1DD;
+}
+
+/* Check icon separado 12px con margin-left (técnica única, sin border-spacing) */
+.hypr-dictate-popover listview row image,
+.hypr-dictate-preferences dropdown popover listview row image {
+    margin-left: 12px;
+}
+
+.hypr-dictate-popover listview row:hover image,
+.hypr-dictate-popover listview row:selected image,
+.hypr-dictate-preferences dropdown popover listview row:hover image,
+.hypr-dictate-preferences dropdown popover listview row:selected image {
+    color: #FFB1DD;
+}
+
+/* Buscador dentro del popover (searchbar / searchentry) coherente */
+.hypr-dictate-popover searchbar,
+.hypr-dictate-preferences dropdown popover searchbar {
+    background-color: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 2px 4px 6px 4px;
+}
+
+.hypr-dictate-popover searchentry,
+.hypr-dictate-popover entry.search,
+.hypr-dictate-preferences dropdown popover searchentry,
+.hypr-dictate-preferences dropdown popover entry.search {
+    font-family: "JetBrainsMono Nerd Font", monospace;
+    color: #F6EFF3;
+    background-color: #241A22;
+    border: 1px solid rgba(239, 148, 199, 0.4);
+    border-radius: 6px;
+    padding: 4px 8px;
+    box-shadow: none;
+}
+
+.hypr-dictate-popover searchentry:focus-within,
+.hypr-dictate-popover entry.search:focus-within,
+.hypr-dictate-preferences dropdown popover searchentry:focus-within,
+.hypr-dictate-preferences dropdown popover entry.search:focus-within {
+    border-color: #EF94C7;
+    box-shadow: 0 0 6px rgba(239, 148, 199, 0.35);
+}
+
+.hypr-dictate-popover searchentry text,
+.hypr-dictate-preferences dropdown popover searchentry text {
+    color: #F6EFF3;
+}
+
+.hypr-dictate-popover searchentry image,
+.hypr-dictate-preferences dropdown popover searchentry image {
+    color: #A78E9B;
+}
+
+/* Scrollbars violeta como en Machete */
+.hypr-dictate-preferences scrollbar {
+    background-color: transparent;
+}
+
+.hypr-dictate-preferences scrollbar trough {
+    background-color: rgba(20, 10, 40, 0.4);
+    border-radius: 4px;
+}
+
+.hypr-dictate-preferences scrollbar slider {
+    min-width: 6px;
+    min-height: 28px;
+    background-color: #5C2C74;
+    border-radius: 4px;
+}
+
+.hypr-dictate-preferences scrollbar slider:hover {
+    background-color: #EF94C7;
+}
+
+/* Selección de texto */
+.hypr-dictate-preferences selection,
+.hypr-dictate-popover selection {
+    background-color: #EF94C7;
+    color: #1A1218;
+}
