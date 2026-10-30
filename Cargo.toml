@@ -15,3 +15,5 @@ wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-protocols-misc = { version = "0.3", features = ["client"] }
 xkbcommon = "0.8"
+gtk4 = "0.10"
+gtk4-layer-shell = { version = "0.7", features = ["v1_3"] }

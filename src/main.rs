@@ -1,4 +1,5 @@
 mod paint;
+mod preferences;
 mod settings;
 mod shortcut;
 mod ui;
@@ -27,8 +28,10 @@ pub enum Event {
     KeyRelease(hypr_dictate::CaptureKey),
     ArmReady(u64, String, bool),
     Finished(u64, Result<(String, String)>),
-    Catalog(Result<Vec<String>>),
+    Catalog(String, u64, Result<Vec<String>>),
     Save(settings::Settings),
+    SavePosition(i32),
+    SaveServer(String),
 }
 struct Capture {
     child: Child,
@@ -40,6 +43,7 @@ pub struct App {
     capture: Option<Capture>,
     lifecycle: hypr_dictate::KeyLifecycle,
     recording_started: Option<std::time::Instant>,
+    catalog_generation: u64,
     tx: mpsc::Sender<Event>,
     client: reqwest::blocking::Client,
     key: String,
@@ -57,6 +61,14 @@ impl App {
             Phase::Error => [160, 75, 210],
         }
     }
+    fn discard_capture(&mut self) {
+        if let Some(mut capture) = self.capture.take() {
+            let _ = capture.child.kill();
+            let _ = capture.child.wait();
+            let _ = capture.reader.join();
+            let _ = capture.errors.join();
+        }
+    }
     fn start(&mut self, ui: &mut ui::Ui) -> Result<()> {
         if !matches!(self.phase, Phase::Idle | Phase::Error) {
             return Ok(());
@@ -65,7 +77,8 @@ impl App {
             // No sobrescribir ventana objetivo si ya se encuentra en fase de armado
             return Ok(());
         }
-        ui.close_modal();
+        self.discard_capture();
+        ui.close_preferences();
         // Capturar ventana enfocada ANTES del foco exclusivo de layer-shell
         let address = active_address()?;
         ensure!(valid_address(&address), "No hay ventana enfocada válida");
@@ -202,12 +215,7 @@ impl App {
     fn cancel(&mut self, ui: &mut ui::Ui) -> Result<()> {
         ui.cancel_arm();
         self.recording_started = None;
-        if let Some(mut capture) = self.capture.take() {
-            let _ = capture.child.kill();
-            let _ = capture.child.wait();
-            let _ = capture.reader.join();
-            let _ = capture.errors.join();
-        }
+        self.discard_capture();
         self.lifecycle.cancel();
         self.phase = Phase::Idle;
         ui.level = 0.;
@@ -279,20 +287,8 @@ impl App {
                         ]
                     }]
                 });
-                let response = client
-                    .post(&endpoint)
-                    .bearer_auth(key)
-                    .json(&body)
-                    .send()
-                    .context("No se pudo conectar con la API")?;
-                ensure!(
-                    response.status().is_success(),
-                    "API devolvió HTTP {}",
-                    response.status()
-                );
-                let mut bytes = Vec::new();
-                response.take(2_000_001).read_to_end(&mut bytes)?;
-                ensure!(bytes.len() <= 2_000_000, "Respuesta demasiado grande");
+                let request = transcription_request(&client, &endpoint, &key, &body);
+                let bytes = send_transcription(request)?;
                 let response: Value =
                     serde_json::from_slice(&bytes).context("Respuesta JSON inválida")?;
                 ensure!(
@@ -311,7 +307,62 @@ impl App {
         });
         Ok(())
     }
+    fn save_server(
+        &mut self,
+        base_url: &str,
+        persist: impl FnOnce(&settings::Settings) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(
+            !matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)),
+            "Espera a terminar el dictado"
+        );
+        let (endpoint, _) = api_endpoints(Some(base_url))?;
+        let mut settings = self.settings.clone();
+        settings.base_url = base_url.into();
+        persist(&settings)?;
+        self.settings = settings;
+        self.endpoint = endpoint;
+        Ok(())
+    }
+    fn request_catalog(&mut self) {
+        self.catalog_generation += 1;
+        let generation = self.catalog_generation;
+        let base_url = self.settings.base_url.clone();
+        let client = self.client.clone();
+        let key = self.key.clone();
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = api_endpoints(Some(&base_url))
+                .and_then(|(_, endpoint)| fetch_catalog(&client, &endpoint, &key));
+            let _ = tx.send(Event::Catalog(base_url, generation, result));
+        });
+    }
+    fn catalog_is_current(&self, base_url: &str, generation: u64) -> bool {
+        self.settings.base_url == base_url && self.catalog_generation == generation
+    }
+    fn save_position(
+        &mut self,
+        x: i32,
+        persist: impl FnOnce(&settings::Settings) -> Result<()>,
+    ) -> Result<()> {
+        let mut settings = self.settings.clone();
+        settings.x = x;
+        persist(&settings)?;
+        self.settings = settings;
+        Ok(())
+    }
+    fn report_error(&mut self, error: anyhow::Error, dictation_error: bool) {
+        eprintln!("hypr-dictate: {error}");
+        self.error = error.to_string();
+        if self.capture.is_none()
+            && (dictation_error
+                || !matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)))
+        {
+            self.phase = Phase::Error;
+        }
+    }
     pub fn event(&mut self, event: Event, ui: &mut ui::Ui) {
+        let dictation_error = matches!(&event, Event::Command(_) | Event::Finished(..));
         let result = match event {
             Event::Ping(ack) => {
                 let _ = ack.send(());
@@ -376,10 +427,7 @@ impl App {
                 match command.as_str() {
                     "reload" | "reset" => {
                         ui.cancel_arm();
-                        if let Some(mut capture) = self.capture.take() {
-                            let _ = capture.child.kill();
-                            let _ = capture.child.wait();
-                        }
+                        self.discard_capture();
                         ui.capture_keyboard(false);
                         if self.lifecycle.dock_temporarily_shown {
                             ui.hide();
@@ -451,19 +499,32 @@ impl App {
                     _ => Ok(()),
                 }
             })(),
-            Event::Catalog(result) => {
+            Event::Catalog(base_url, generation, result) => {
+                if !self.catalog_is_current(&base_url, generation) {
+                    return;
+                }
                 match result {
                     Ok(models) => {
                         ui.models = models;
                         ui.catalog_loaded();
+                        Ok(())
                     }
                     Err(e) => {
                         ui.message = format!("Error cargando catálogo: {e}");
                         ui.dirty = true;
+                        Err(e)
                     }
                 }
-                Ok(())
-            },
+            }
+            Event::SaveServer(base_url) => self
+                .save_server(&base_url, settings::Settings::save)
+                .map(|()| {
+                    ui.server_saved(&self.settings.base_url);
+                    self.request_catalog();
+                }),
+            Event::SavePosition(x) => self.save_position(x, settings::Settings::save).map(|()| {
+                ui.position_saved(self.settings.x);
+            }),
             Event::Save(settings) => (|| -> Result<()> {
                 ensure!(
                     !matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)),
@@ -486,8 +547,11 @@ impl App {
                 if settings.shortcut != self.settings.shortcut {
                     shortcut::apply(&settings.shortcut, &self.settings.shortcut)?;
                 }
+                let mut settings = settings;
+                settings.base_url = self.settings.base_url.clone();
                 settings.save()?;
                 self.settings = settings;
+                ui.settings_saved(&self.settings);
                 ui.message = "Ajustes guardados".into();
                 Ok(())
             })(),
@@ -550,8 +614,7 @@ impl App {
             })(),
         };
         if let Err(error) = result {
-            eprintln!("hypr-dictate: {error}");
-            self.error = error.to_string();
+            self.report_error(error, dictation_error);
             ui.message = self.error.clone();
             if self.lifecycle.waiting_release.is_none() {
                 ui.capture_keyboard(false);
@@ -569,13 +632,90 @@ impl App {
 }
 impl Drop for App {
     fn drop(&mut self) {
-        if let Some(mut capture) = self.capture.take() {
-            let _ = capture.child.kill();
-            let _ = capture.child.wait();
-            let _ = capture.reader.join();
-            let _ = capture.errors.join();
-        }
+        self.discard_capture();
     }
+}
+fn api_endpoints(base: Option<&str>) -> Result<(String, String)> {
+    let base = base.unwrap_or(settings::DEFAULT_BASE_URL);
+    let mut url = reqwest::Url::parse(base)
+        .map_err(|_| anyhow::anyhow!("La URL del servidor no es válida"))?;
+    ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "La URL del servidor debe usar HTTP o HTTPS, sin credenciales, parámetros ni fragmentos"
+    );
+    let path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&format!("{path}/v1/chat/completions"));
+    let transcription = url.to_string();
+    url.set_path(&format!("{path}/v1/models"));
+    url.set_query(Some("client_version=1"));
+    Ok((transcription, url.into()))
+}
+fn fetch_catalog(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    key: &str,
+) -> Result<Vec<String>> {
+    let response = client
+        .get(endpoint)
+        .bearer_auth(key)
+        .send()?
+        .error_for_status()?;
+    let value: Value = response.json()?;
+    let models = settings::routes(&value);
+    ensure!(!models.is_empty(), "Catálogo de modelos vacío");
+    Ok(models)
+}
+fn transcription_request(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    key: &str,
+    body: &Value,
+) -> reqwest::blocking::RequestBuilder {
+    client
+        .post(endpoint)
+        .bearer_auth(key)
+        .json(body)
+}
+fn transcription_error(error: anyhow::Error) -> anyhow::Error {
+    let timed_out = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                error.kind() == std::io::ErrorKind::TimedOut
+                    || error
+                        .get_ref()
+                        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+                        .is_some_and(reqwest::Error::is_timeout)
+            })
+    });
+    error.context(if timed_out {
+        "Tiempo de espera agotado durante la transcripción"
+    } else {
+        "Falló la comunicación con la API durante la transcripción"
+    })
+}
+fn send_transcription(request: reqwest::blocking::RequestBuilder) -> Result<Vec<u8>> {
+    let response = request
+        .send()
+        .map_err(|error| transcription_error(error.into()))?;
+    ensure!(
+        response.status().is_success(),
+        "API devolvió HTTP {}",
+        response.status()
+    );
+    let mut bytes = Vec::new();
+    response
+        .take(2_000_001)
+        .read_to_end(&mut bytes)
+        .map_err(|error| transcription_error(error.into()))?;
+    ensure!(bytes.len() <= 2_000_000, "Respuesta demasiado grande");
+    Ok(bytes)
 }
 fn hypr(args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("hyprctl").args(args).output()?;
@@ -741,6 +881,8 @@ fn main() -> Result<()> {
     }
     let key = std::env::var("CLIPROXYAPI_API_KEY").context("Falta CLIPROXYAPI_API_KEY")?;
     ensure!(!key.is_empty(), "CLIPROXYAPI_API_KEY está vacía");
+    let settings = settings::Settings::load()?;
+    let (endpoint, _) = api_endpoints(Some(&settings.base_url))?;
     // Never unlink an existing path: it may belong to another live process.
     let listener = UnixListener::bind(&path).context(
         "Socket ocupado: si no hay otro proceso, elimina manualmente el socket residual",
@@ -775,11 +917,12 @@ fn main() -> Result<()> {
             }
         }
     });
-    let app = App {
+    let mut app = App {
         phase: Phase::Idle,
         capture: None,
         lifecycle: hypr_dictate::KeyLifecycle::new(),
         recording_started: None,
+        catalog_generation: 0,
         tx,
         client: reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(25))
@@ -787,34 +930,39 @@ fn main() -> Result<()> {
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
         key,
-        endpoint: "http://127.0.0.1:8317/v1/chat/completions".into(),
-        settings: settings::Settings::load()?,
+        endpoint,
+        settings,
         level: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         error: String::new(),
     };
-    let catalog_client = app.client.clone();
-    let catalog_key = app.key.clone();
-    let catalog_tx = app.tx.clone();
-    thread::spawn(move || {
-        let result = (|| -> Result<Vec<String>> {
-            let response = catalog_client
-                .get("http://127.0.0.1:8317/v1/models?client_version=1")
-                .bearer_auth(catalog_key)
-                .send()?
-                .error_for_status()?;
-            let value: Value = response.json()?;
-            let models = settings::routes(&value);
-            ensure!(!models.is_empty(), "Catálogo de modelos vacío");
-            Ok(models)
-        })();
-        let _ = catalog_tx.send(Event::Catalog(result));
-    });
+    app.request_catalog();
     ui::run(app, rx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) fn app(phase: Phase) -> App {
+        let (tx, _) = mpsc::channel();
+        App {
+            phase,
+            capture: None,
+            lifecycle: hypr_dictate::KeyLifecycle::new(),
+            recording_started: None,
+            catalog_generation: 0,
+            tx,
+            client: reqwest::blocking::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap(),
+            key: String::new(),
+            endpoint: String::new(),
+            settings: settings::Settings::default(),
+            level: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            error: String::new(),
+        }
+    }
 
     #[test]
     fn validates_supported_cli_commands() {
@@ -842,6 +990,7 @@ mod tests {
             capture: None,
             lifecycle: hypr_dictate::KeyLifecycle::new(),
             recording_started: None,
+            catalog_generation: 0,
             tx,
             client: reqwest::blocking::Client::new(),
             key: "key".into(),
@@ -853,5 +1002,340 @@ mod tests {
 
         assert!(app.capture.is_none());
         assert_eq!(app.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn saving_server_works_without_catalog_and_preserves_other_settings() {
+        let mut app = app(Phase::Idle);
+        app.settings.model = "saved/model".into();
+        app.settings.shortcut = "SUPER + F9".into();
+        let mut expected = app.settings.clone();
+        expected.base_url = "https://proxy.example/service".into();
+        let mut calls = 0;
+        app.save_server(&expected.base_url, |candidate| {
+            calls += 1;
+            assert_eq!(format!("{candidate:?}"), format!("{expected:?}"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(format!("{:?}", app.settings), format!("{expected:?}"));
+        assert_eq!(
+            app.endpoint,
+            "https://proxy.example/service/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn server_save_failures_or_active_dictation_do_not_apply_changes() {
+        for phase in [Phase::Recording("0xabc".into()), Phase::Processing("0xabc".into())] {
+            let mut app = app(phase);
+            let original = format!("{:?}", app.settings);
+            let error = app
+                .save_server("http://127.0.0.1:9000", |_| {
+                    panic!("must not persist server during dictation")
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("Espera a terminar"));
+            assert_eq!(format!("{:?}", app.settings), original);
+        }
+        let mut app = app(Phase::Idle);
+        let original = format!("{:?}", app.settings);
+        app.save_server("http://127.0.0.1:9000", |_| bail!("disk full"))
+            .unwrap_err();
+        assert_eq!(format!("{:?}", app.settings), original);
+        assert!(app.endpoint.is_empty());
+        app.save_server("ftp://invalid", |_| panic!("invalid URL must not persist"))
+            .unwrap_err();
+    }
+
+    #[test]
+    fn catalogue_replies_must_match_server_and_generation() {
+        let mut app = app(Phase::Idle);
+        app.settings.base_url = "http://127.0.0.1:9000".into();
+        app.catalog_generation = 3;
+        assert!(app.catalog_is_current("http://127.0.0.1:9000", 3));
+        assert!(!app.catalog_is_current("http://127.0.0.1:8317", 3));
+        assert!(!app.catalog_is_current("http://127.0.0.1:9000", 1));
+    }
+
+    #[test]
+    fn api_urls_use_default_or_configured_http_and_https_base() {
+        for (base, root) in [
+            (None, "http://127.0.0.1:8317"),
+            (Some("http://127.0.0.1:9000/"), "http://127.0.0.1:9000"),
+            (Some("https://proxy.example"), "https://proxy.example"),
+            (
+                Some("https://proxy.example/service/"),
+                "https://proxy.example/service",
+            ),
+        ] {
+            let (transcription, catalog) = api_endpoints(base).unwrap();
+            assert_eq!(transcription, format!("{root}/v1/chat/completions"));
+            assert_eq!(catalog, format!("{root}/v1/models?client_version=1"));
+        }
+    }
+
+    #[test]
+    fn configured_server_receives_catalog_and_transcription_requests() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/proxy/", listener.local_addr().unwrap());
+        let (transcription, _) = api_endpoints(Some(&base)).unwrap();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for body in [r#"{"data":[{"id":"available/model"}]}"#, "{}"] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let length = request
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':')
+                            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    })
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                socket.read_exact(&mut vec![0; length]).unwrap();
+                requests.push(request.lines().next().unwrap().to_owned());
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        let mut app = app(Phase::Idle);
+        app.client = client.clone();
+        app.tx = tx;
+        app.settings.base_url = base.clone();
+        app.request_catalog();
+        let Event::Catalog(reply_base, generation, models) =
+            rx.recv_timeout(Duration::from_secs(3)).unwrap()
+        else {
+            panic!("expected catalogue reply");
+        };
+        assert_eq!(reply_base, base);
+        assert_eq!(generation, 1);
+        assert!(app.catalog_is_current(&reply_base, generation));
+        let models = models.unwrap();
+        let body = send_transcription(transcription_request(
+            &client,
+            &transcription,
+            "test",
+            &json!({}),
+        ))
+        .unwrap();
+        assert_eq!(models, ["available/model"]);
+        assert_eq!(body, b"{}");
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                "GET /proxy/v1/models?client_version=1 HTTP/1.1",
+                "POST /proxy/v1/chat/completions HTTP/1.1",
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_or_ambiguous_api_base_is_rejected_without_echoing_it() {
+        for base in [
+            "",
+            "not-a-url",
+            "ftp://proxy.example",
+            "file:///tmp/api",
+            "http://",
+            "https://user:secret@proxy.example",
+            "https://proxy.example?key=secret",
+            "https://proxy.example#fragment",
+        ] {
+            let error = api_endpoints(Some(base)).unwrap_err();
+            assert!(error.to_string().contains("URL del servidor"));
+            assert!(!format!("{error:#}").contains("secret"));
+        }
+    }
+
+
+
+    fn delayed_api(send_headers_first: bool, delay: Duration) -> (String, thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let length = String::from_utf8(request)
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                })
+                .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                .unwrap_or(0);
+            socket.read_exact(&mut vec![0; length]).unwrap();
+            let headers = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
+            if send_headers_first {
+                socket.write_all(headers).unwrap();
+            }
+            thread::sleep(delay);
+            if !send_headers_first && socket.write_all(headers).is_err() {
+                return;
+            }
+            let _ = socket.write_all(b"{}");
+        });
+        (endpoint, server)
+    }
+
+    #[test]
+    fn transcription_retains_default_client_timeout() {
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(25))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let request = transcription_request(&client, "http://127.0.0.1/", "test", &json!({}))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.timeout(),
+            None,
+            "transcription must retain the 25s client default"
+        );
+        let catalog = client.get("http://127.0.0.1/v1/models").build().unwrap();
+        assert_eq!(
+            catalog.timeout(),
+            None,
+            "catalog must retain the 25s client default"
+        );
+    }
+
+    #[test]
+    fn transcription_timeout_is_identified_before_headers_and_during_body() {
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        for send_headers_first in [false, true] {
+            let (endpoint, server) = delayed_api(send_headers_first, Duration::from_millis(200));
+            let request = transcription_request(&client, &endpoint, "test", &json!({}))
+                .timeout(Duration::from_millis(100));
+            let error = send_transcription(request).unwrap_err();
+            server.join().unwrap();
+            assert!(
+                error.to_string().contains("Tiempo de espera agotado"),
+                "{error:#}"
+            );
+            assert!(!error.to_string().contains("conectar"));
+        }
+    }
+
+    #[test]
+    fn transcription_connection_failure_is_not_reported_as_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let error = send_transcription(transcription_request(
+            &client,
+            &endpoint,
+            "test",
+            &json!({}),
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains("comunicación"), "{error:#}");
+        assert!(!error.to_string().contains("Tiempo de espera agotado"));
+    }
+
+    #[test]
+    fn position_save_preserves_every_other_setting_and_active_phase() {
+        for phase in [
+            Phase::Idle,
+            Phase::Recording("0xdef".into()),
+            Phase::Processing("0xdef".into()),
+        ] {
+            let mut app = app(phase);
+            app.settings = settings::Settings {
+                model: "offline/model".into(),
+                base_url: settings::DEFAULT_BASE_URL.into(),
+                x: 123,
+                shortcut: "SUPER + F9".into(),
+                microphone: "saved-mic".into(),
+                monitor: "saved-monitor".into(),
+                temperature: 0.7,
+                prompt: "saved prompt".into(),
+            };
+            let mut expected = app.settings.clone();
+            expected.x = 456;
+            let phase = format!("{:?}", app.phase);
+            let mut calls = 0;
+            app.save_position(456, |candidate| {
+                calls += 1;
+                assert_eq!(format!("{candidate:?}"), format!("{expected:?}"));
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(format!("{:?}", app.settings), format!("{expected:?}"));
+            assert_eq!(format!("{:?}", app.phase), phase);
+        }
+    }
+
+    #[test]
+    fn failed_position_save_preserves_committed_settings() {
+        let mut app = app(Phase::Processing("0xdef".into()));
+        let expected = format!("{:?}", app.settings);
+        let error = app.save_position(456, |_| bail!("disk full")).unwrap_err();
+        app.report_error(error, false);
+        assert_eq!(format!("{:?}", app.settings), expected);
+        assert_eq!(app.phase, Phase::Processing("0xdef".into()));
+        assert_eq!(app.error, "disk full");
+    }
+
+    #[test]
+    fn discarding_capture_kills_and_reaps_child() {
+        let mut app = app(Phase::Idle);
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        app.capture = Some(Capture {
+            child,
+            reader: thread::spawn(|| Ok(Vec::new())),
+            errors: thread::spawn(|| Ok(Vec::new())),
+        });
+        app.discard_capture();
+        assert!(app.capture.is_none(), "residual capture must be removed");
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            -1,
+            "capture is still alive or a zombie"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 }
