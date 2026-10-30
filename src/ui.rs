@@ -158,7 +158,7 @@ impl Ui {
             xkb_state: None,
             configured: false,
             closed: false,
-            color: [55, 170, 130],
+            color: [120, 165, 136],
             models: Vec::new(),
             message: String::new(),
             draft: crate::settings::Settings::default(),
@@ -347,12 +347,13 @@ impl Ui {
             (),
         );
         layer.set_size(176, 44);
-        layer.set_anchor(Anchor::Bottom | Anchor::Left);
+        layer.set_anchor(Anchor::Top | Anchor::Left);
         self.update_max_x();
         self.draft.x = self.draft.x.clamp(0, self.max_x);
         layer.set_margin(0, 0, 0, self.draft.x);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-        layer.set_exclusive_zone(0);
+        // -1 ignores exclusive zones of panels/bars, extending to physical edge
+        layer.set_exclusive_zone(-1);
         surface.commit();
         self.surface = Some(surface);
         self.layer = Some(layer);

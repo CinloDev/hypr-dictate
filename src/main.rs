@@ -55,10 +55,10 @@ pub struct App {
 impl App {
     pub fn color(&self) -> [u8; 3] {
         match self.phase {
-            Phase::Idle => [55, 170, 130],
-            Phase::Recording(_) => [235, 65, 75],
-            Phase::Processing(_) => [230, 170, 40],
-            Phase::Error => [160, 75, 210],
+            Phase::Idle => [120, 165, 136],
+            Phase::Recording(_) => [240, 151, 138],
+            Phase::Processing(_) => [224, 194, 122],
+            Phase::Error => [240, 151, 138],
         }
     }
     fn discard_capture(&mut self) {
@@ -1314,6 +1314,14 @@ mod tests {
         assert_eq!(format!("{:?}", app.settings), expected);
         assert_eq!(app.phase, Phase::Processing("0xdef".into()));
         assert_eq!(app.error, "disk full");
+    }
+
+    #[test]
+    fn app_colors_match_phase_specifications() {
+        assert_eq!(app(Phase::Idle).color(), [120, 165, 136]);
+        assert_eq!(app(Phase::Recording("0x1".into())).color(), [240, 151, 138]);
+        assert_eq!(app(Phase::Processing("0x1".into())).color(), [224, 194, 122]);
+        assert_eq!(app(Phase::Error).color(), [240, 151, 138]);
     }
 
     #[test]

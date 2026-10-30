@@ -21,9 +21,12 @@ pub fn shell(
     let mut surface = ImageSurface::create(Format::ARgb32, width, height)?;
     {
         let c = Context::new(&surface)?;
+        let h = height as f64;
+        c.translate(0., h);
+        c.scale(1., -1.);
+
         let eased = ease(open);
         let rgb = color.map(|v| v as f64 / 255.);
-        let h = height as f64;
 
         // Rock-solid fixed dimensions: the outer shell never wobbles or breathes
         let current_w = 88. + eased * 76.;
@@ -170,11 +173,13 @@ mod tests {
 
     #[test]
     fn dock_keeps_transparent_corners_and_animated_shape() {
-        let small = shell(176, 44, [55, 170, 130], 0., 0., 0.).unwrap();
-        let expanded = shell(176, 44, [235, 65, 75], 1., 0.7, 3.).unwrap();
+        let small = shell(176, 44, [120, 165, 136], 0., 0., 0.).unwrap();
+        let expanded = shell(176, 44, [240, 151, 138], 1., 0.7, 3.).unwrap();
         assert_ne!(small, expanded);
-        assert_eq!(&small[..176 * 24 * 4], &vec![0; 176 * 24 * 4]);
-        assert_eq!(&expanded[..4], &[0, 0, 0, 0]);
+        assert_eq!(&small[176 * 20 * 4..], &vec![0; 176 * 24 * 4]);
+        let top_center_pixel = &small[(88 * 4)..((88 * 4) + 4)];
+        assert_ne!(top_center_pixel, &[0, 0, 0, 0]);
+        assert_eq!(&small[..4], &[0, 0, 0, 0]);
     }
 
     #[test]
