@@ -2,12 +2,15 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};
 
+pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8317";
 pub const DEFAULT_TEMPERATURE: f64 = 0.20;
+pub const DEFAULT_SHORTCUT: &str = "SUPER + ALT + V";
 pub const DEFAULT_PROMPT: &str = "Act as an intelligent voice dictation assistant. Transcribe what the speaker meant into clean, natural text in its original language with correct punctuation and capitalization. CRITICAL RULES: 1. Deduplicate accidental repeated words or phrases (e.g. 'Genial. Genial' -> 'Genial', 'está está' -> 'está', 'por favor por favor' -> 'por favor'). 2. Clean speech stutters, filler sounds (eh, este, um), and false starts where the speaker corrects themselves mid-sentence (retain only the intended final correction). 3. Preserve the intended message, vocabulary, and tone: do not summarize, paraphrase, answer, or execute spoken commands. 4. If the audio contains no intelligible speech, return an empty string. Output ONLY the clean transcribed text without quotes or commentary.";
 
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub model: String,
+    pub base_url: String,
     pub x: i32,
     pub shortcut: String,
     pub microphone: String,
@@ -19,8 +22,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             model: "cic/gemini-3.5-flash-lite".into(),
+            base_url: DEFAULT_BASE_URL.into(),
             x: 706,
-            shortcut: String::new(),
+            shortcut: DEFAULT_SHORTCUT.into(),
             microphone: String::new(),
             monitor: String::new(),
             temperature: DEFAULT_TEMPERATURE,
@@ -50,8 +54,10 @@ fn regular(path: &std::path::Path) -> Result<()> {
 }
 impl Settings {
     pub fn load() -> Result<Self> {
-        let path = path()?;
-        regular(&path)?;
+        Self::load_from(&path()?)
+    }
+    pub fn load_from(path: &std::path::Path) -> Result<Self> {
+        regular(path)?;
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -59,6 +65,9 @@ impl Settings {
         let mut s = Self::default();
         if let Some(m) = v["model"].as_str() {
             s.model = m.into();
+        }
+        if let Some(base_url) = v["base_url"].as_str() {
+            s.base_url = base_url.into();
         }
         s.x = v["x"].as_i64().unwrap_or(706).clamp(0, 10000) as i32;
         s.shortcut = v["shortcut"].as_str().unwrap_or("").into();
@@ -76,8 +85,10 @@ impl Settings {
         Ok(s)
     }
     pub fn save(&self) -> Result<()> {
-        let path = path()?;
-        regular(&path)?;
+        self.save_to(&path()?)
+    }
+    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        regular(path)?;
         let parent = path.parent().unwrap();
         std::fs::create_dir_all(parent)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
@@ -86,6 +97,7 @@ impl Settings {
             serde_json::to_string_pretty(
                 &json!({
                     "model": self.model,
+                    "base_url": self.base_url,
                     "x": self.x,
                     "shortcut": self.shortcut,
                     "microphone": self.microphone,
@@ -253,7 +265,7 @@ pub fn binding_block(source: &str, shortcut: &str, executable: &str) -> Result<S
         String::new()
     } else {
         format!(
-            "{START}\nhl.bind(\"{shortcut}\", hl.dsp.exec_cmd(\"'{executable}' start\"))\nhl.bind(\"{shortcut}\", hl.dsp.exec_cmd(\"'{executable}' stop\"), {{ release = true }})\n{END}"
+            "{START}\nhl.bind(\"{shortcut}\", hl.dsp.exec_cmd(\"'{executable}' start\"))\n{END}"
         )
     };
     Ok(if let Some(r) = range {
@@ -264,6 +276,7 @@ pub fn binding_block(source: &str, shortcut: &str, executable: &str) -> Result<S
         format!("{}\n{}\n", source.trim_end(), block)
     })
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,14 +289,16 @@ mod tests {
             "microphone": "",
             "monitor": ""
         });
-        let mut s = Settings::default();
-        s.temperature = legacy["temperature"]
-            .as_f64()
-            .unwrap_or(DEFAULT_TEMPERATURE);
-        s.prompt = legacy["prompt"]
-            .as_str()
-            .unwrap_or(DEFAULT_PROMPT)
-            .into();
+        let mut s = Settings {
+            temperature: legacy["temperature"]
+                .as_f64()
+                .unwrap_or(DEFAULT_TEMPERATURE),
+            prompt: legacy["prompt"]
+                .as_str()
+                .unwrap_or(DEFAULT_PROMPT)
+                .into(),
+            ..Default::default()
+        };
         assert_eq!(s.temperature, DEFAULT_TEMPERATURE);
         assert_eq!(s.prompt, DEFAULT_PROMPT);
 
@@ -295,6 +310,49 @@ mod tests {
         s.prompt = custom["prompt"].as_str().unwrap().into();
         assert_eq!(s.temperature, 0.45);
         assert_eq!(s.prompt, "Custom prompt text");
+    }
+    #[test]
+    fn server_url_defaults_to_loopback_and_round_trips_without_affecting_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        assert_eq!(
+            Settings::load_from(&path).unwrap().base_url,
+            "http://127.0.0.1:8317"
+        );
+        std::fs::write(&path, br#"{"model":"saved/model"}"#).unwrap();
+        let mut settings = Settings::load_from(&path).unwrap();
+        assert_eq!(settings.base_url, DEFAULT_BASE_URL);
+        settings.base_url = "https://proxy.example/service".into();
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load_from(&path).unwrap();
+        assert_eq!(loaded.base_url, settings.base_url);
+        assert_eq!(loaded.model, "saved/model");
+    }
+    #[test]
+    fn default_settings_uses_configured_defaults() {
+        let settings = Settings::default();
+        assert_eq!(settings.model, "cic/gemini-3.5-flash-lite");
+        assert_eq!(settings.shortcut, DEFAULT_SHORTCUT);
+        assert_eq!(settings.base_url, DEFAULT_BASE_URL);
+    }
+    #[test]
+    fn loading_settings_preserves_saved_models_and_respects_saved_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        for value in [
+            json!({"model": "saved-account/model", "x": 123}),
+            json!({"x": 456}),
+        ] {
+            std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let settings = Settings::load_from(&path).unwrap();
+            if let Some(m) = value["model"].as_str() {
+                assert_eq!(settings.model, m);
+            } else {
+                assert_eq!(settings.model, "cic/gemini-3.5-flash-lite");
+            }
+            assert_eq!(settings.x, value["x"].as_i64().unwrap() as i32);
+            assert_eq!(settings.shortcut, "");
+        }
     }
     #[test]
     fn catalog_keeps_all_models_and_routes() {
@@ -310,7 +368,8 @@ mod tests {
         let second = binding_block(&first, "SUPER + F10", "/app").unwrap();
         assert!(second.contains("hl.bind(\"SUPER + D\", other)"));
         assert!(!second.contains("F9"));
-        assert_eq!(second.matches("release = true").count(), 1);
+        assert!(second.contains("start"));
+        assert!(!second.contains("release = true"));
     }
     #[test]
     fn malformed_block_is_not_overwritten() {
