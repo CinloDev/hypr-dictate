@@ -1,3 +1,29 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DictationMode {
+    #[default]
+    Transcription,
+    Writing,
+}
+
+impl DictationMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Transcription => "transcription",
+            Self::Writing => "writing",
+        }
+    }
+}
+
+impl std::fmt::Display for DictationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+pub type DictationLifecycle = KeyLifecycle;
+pub type KeyCode = CaptureKey;
+pub type RecordingPhase = Phase;
+
 #[derive(Debug, PartialEq)]
 pub enum Phase {
     Idle,
@@ -220,15 +246,16 @@ impl ArmingState {
         for &k in keys {
             self.pressed_keys.insert(k);
         }
+        if self.mods_depressed == 0 && self.pressed_keys.is_empty() {
+            self.seen_modifiers = true;
+        }
     }
 
     pub fn on_modifiers(&mut self, mods: u32) -> bool {
         if !self.is_arming {
             return false;
         }
-        if self.seen_enter {
-            self.seen_modifiers = true;
-        }
+        self.seen_modifiers = true;
         self.mods_depressed = mods;
         self.check_ready()
     }
@@ -395,89 +422,8 @@ pub fn plan_chunks(text: &str) -> Vec<ChunkPlan> {
     out
 }
 
-fn normalize_char(c: char) -> char {
-    match c {
-        'á' | 'Á' => 'a',
-        'é' | 'É' => 'e',
-        'í' | 'Í' => 'i',
-        'ó' | 'Ó' => 'o',
-        'ú' | 'Ú' | 'ü' | 'Ü' => 'u',
-        other => other.to_ascii_lowercase(),
-    }
-}
-
 pub fn clean_repeated_words(text: &str) -> String {
-    let mut tokens: Vec<(String, bool)> = Vec::new();
-    let mut current = String::new();
-    let mut is_word: Option<bool> = None;
-
-    for ch in text.chars() {
-        let ch_is_word = ch.is_alphanumeric();
-        match is_word {
-            None => {
-                is_word = Some(ch_is_word);
-                current.push(ch);
-            }
-            Some(w) if w == ch_is_word => {
-                current.push(ch);
-            }
-            Some(_) => {
-                tokens.push((std::mem::take(&mut current), is_word.unwrap()));
-                current.push(ch);
-                is_word = Some(ch_is_word);
-            }
-        }
-    }
-    if !current.is_empty() {
-        tokens.push((current, is_word.unwrap_or(false)));
-    }
-
-    let mut out_tokens: Vec<(String, bool)> = Vec::new();
-    let mut last_word_norm: Option<String> = None;
-
-    for (token_text, token_is_word) in tokens {
-        if token_is_word {
-            let norm: String = token_text.chars().map(normalize_char).collect();
-            if let Some(prev) = &last_word_norm
-                && prev == &norm
-            {
-                // Accidental immediate repetition! Drop the separator preceding it
-                if let Some((_, false)) = out_tokens.last() {
-                    out_tokens.pop();
-                }
-                continue;
-            }
-            last_word_norm = Some(norm);
-            out_tokens.push((token_text, true));
-        } else {
-            out_tokens.push((token_text, false));
-        }
-    }
-
-    // Assemble and normalize redundant punctuation/spacing
-    let mut result = String::with_capacity(text.len());
-    let mut prev_char: Option<char> = None;
-
-    for (t, _) in out_tokens {
-        for ch in t.chars() {
-            // Avoid duplicate punctuation like "..", ",,", "??"
-            if matches!(ch, '.' | ',' | ';' | ':' | '!' | '?')
-                && prev_char == Some(ch)
-            {
-                continue;
-            }
-            // Avoid space immediately before punctuation: "word ." -> "word."
-            if matches!(ch, '.' | ',' | ';' | ':' | '!' | '?')
-                && prev_char == Some(' ')
-            {
-                result.pop();
-            }
-            result.push(ch);
-            prev_char = Some(ch);
-        }
-    }
-
-    result
+    sanitize_transcribed_text(text)
 }
 
 pub fn is_line_break(ch: char) -> bool {
@@ -487,37 +433,108 @@ pub fn is_line_break(ch: char) -> bool {
     )
 }
 
-pub fn sanitize_dictated_insertion(text: &str) -> String {
-    let converted: String = text
-        .chars()
-        .map(|c| if is_line_break(c) { ' ' } else { c })
-        .collect();
-    sanitize_plain_text(&converted)
-}
-
-pub fn sanitize_plain_text(text: &str) -> String {
-    let deduplicated = clean_repeated_words(text);
-    let mut out = String::with_capacity(deduplicated.len());
+pub fn sanitize_transcribed_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
     let mut prev_space = false;
-    for ch in deduplicated.chars() {
-        let mapped = if matches!(ch, '\n' | '\r' | '\t') {
-            ' '
-        } else if ch.is_control() {
-            continue;
-        } else {
-            ch
-        };
-        if mapped == ' ' {
+    for ch in raw.chars() {
+        let is_space = is_line_break(ch) || matches!(ch, ' ' | '\t');
+        if is_space {
             if !prev_space && !out.is_empty() {
                 out.push(' ');
             }
             prev_space = true;
-        } else {
-            out.push(mapped);
+        } else if !ch.is_control() {
+            out.push(ch);
             prev_space = false;
         }
     }
-    out.trim_end().to_owned()
+    out.trim_matches(' ').to_string()
+}
+
+pub fn sanitize_dictated_insertion(text: &str) -> String {
+    sanitize_transcribed_text(text)
+}
+
+pub fn sanitize_plain_text(text: &str) -> String {
+    sanitize_transcribed_text(text)
+}
+
+pub fn sanitize_writing_text(raw: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut text = trimmed;
+
+    // Strip outer markdown code fence if wrapped by LLM (```markdown ... ``` or ```text ... ``` or ``` ... ```)
+    if text.starts_with("```")
+        && let Some(first_newline) = text.find('\n')
+    {
+        let fence_line = &text[..first_newline];
+        if fence_line.trim_start().starts_with("```") {
+            let after_open = &text[first_newline + 1..];
+            if let Some(stripped_close) = after_open.strip_suffix("```") {
+                text = stripped_close.trim();
+            } else if let Some(last_fence) = after_open.rfind("\n```") {
+                let candidate = &after_open[..last_fence];
+                let rest = &after_open[last_fence + 4..];
+                if rest.trim().is_empty() {
+                    text = candidate.trim();
+                }
+            }
+        }
+    }
+
+    // Strip outer matching quotes if LLM wrapped whole output in quotes
+    if (text.starts_with('"') && text.ends_with('"') && text.len() >= 2)
+        || (text.starts_with('“') && text.ends_with('”') && text.len() >= '“'.len_utf8() + '”'.len_utf8())
+    {
+        let first_len = text.chars().next().unwrap().len_utf8();
+        let last_len = text.chars().last().unwrap().len_utf8();
+        text = text[first_len..text.len() - last_len].trim();
+    }
+
+    // Strip common conversational LLM prefixes if output starts with them on line 1
+    for prefix in [
+        "Aquí tienes el texto:",
+        "Aquí está el texto:",
+        "Aquí tienes:",
+        "Aquí está:",
+        "Texto redactado:",
+        "Here is the text:",
+        "Here is the revised text:",
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = rest.trim_start();
+        }
+    }
+
+    // Preserve paragraph breaks (\n, \n\n) and indentation/tabs (\t), strip control chars
+    let mut result = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\t' || !ch.is_control() {
+            result.push(ch);
+        }
+    }
+
+    result.trim().to_string()
+}
+
+pub fn sanitize_redaction_text(raw: &str) -> String {
+    sanitize_writing_text(raw)
+}
+
+pub fn sanitize_text_for_mode(raw: &str, mode: DictationMode) -> String {
+    match mode {
+        DictationMode::Transcription => sanitize_transcribed_text(raw),
+        DictationMode::Writing => sanitize_writing_text(raw),
+    }
+}
+
+pub fn insertion_uses_clipboard(mode: DictationMode, target_is_xwayland: bool) -> bool {
+    mode == DictationMode::Writing || target_is_xwayland
 }
 
 #[cfg(test)]
@@ -594,6 +611,14 @@ mod tests {
         // Liberar modificadores
         assert!(arm.on_modifiers(0), "Debe transicionar a listo al soltar modificadores tras Enter");
         assert!(!arm.is_arming);
+    }
+
+    #[test]
+    fn arming_ready_immediately_when_fast_tap_modifiers_already_released() {
+        let mut arm = ArmingState::new();
+        arm.arm("0x1234abcd".into());
+        arm.on_enter(true, &[]);
+        assert!(arm.check_ready(), "Si en Enter los modificadores y teclas ya están en 0, debe armar de inmediato");
     }
 
     #[test]
@@ -806,20 +831,88 @@ mod tests {
         let cleaned = super::clean_repeated_words(input);
         assert_eq!(
             cleaned,
-            "Genial, funciona muy bien. Está perfecto, así que bueno, esto es una transcripción de prueba para que veas cómo está transcribiendo."
+            "Genial. Genial, funciona muy bien. Está Está perfecto, así que bueno, esto es una transcripción de prueba para que veas cómo está transcribiendo."
         );
         assert_eq!(
             super::clean_repeated_words("Hola, hola mundo."),
-            "Hola mundo."
+            "Hola, hola mundo."
         );
         assert_eq!(
             super::clean_repeated_words("vamos vamos a ver"),
-            "vamos a ver"
+            "vamos vamos a ver"
         );
         assert_eq!(
             super::clean_repeated_words("Esto es una prueba normal."),
             "Esto es una prueba normal."
         );
+    }
+
+    #[test]
+    fn preserves_legitimate_repeated_words_and_numbers() {
+        assert_eq!(
+            super::sanitize_transcribed_text("hola hola"),
+            "hola hola"
+        );
+        assert_eq!(
+            super::sanitize_transcribed_text("9 9"),
+            "9 9"
+        );
+        assert_eq!(
+            super::sanitize_transcribed_text("cinco cinco cuatro"),
+            "cinco cinco cuatro"
+        );
+        assert_eq!(
+            super::sanitize_transcribed_text("muy muy bien"),
+            "muy muy bien"
+        );
+        assert_eq!(
+            super::sanitize_transcribed_text("  espacio   múltiple \t"),
+            "espacio múltiple"
+        );
+    }
+
+    #[test]
+    fn writing_mode_sanitization_and_insertion_policy() {
+        assert_eq!(
+            super::sanitize_text_for_mode("hola hola", super::DictationMode::Transcription),
+            "hola hola"
+        );
+        assert_eq!(
+            super::sanitize_writing_text("```markdown\nPárrafo 1\n\nPárrafo 2\n```"),
+            "Párrafo 1\n\nPárrafo 2"
+        );
+        assert_eq!(
+            super::sanitize_writing_text("```\nPárrafo 1\n\nPárrafo 2\n```"),
+            "Párrafo 1\n\nPárrafo 2"
+        );
+        assert_eq!(
+            super::sanitize_writing_text("Texto con sangría:\n\t- Elemento 1\n\t- Elemento 2"),
+            "Texto con sangría:\n\t- Elemento 1\n\t- Elemento 2"
+        );
+        assert_eq!(
+            super::sanitize_writing_text("Línea 1\r\n\r\nLínea 2"),
+            "Línea 1\n\nLínea 2"
+        );
+        assert_eq!(
+            super::sanitize_writing_text("Aquí tienes el texto:\nEstimado Juan,\n\nSaludos."),
+            "Estimado Juan,\n\nSaludos."
+        );
+
+        // Sanitize for mode dispatch
+        assert_eq!(
+            super::sanitize_text_for_mode("Párrafo 1\n\nPárrafo 2", super::DictationMode::Transcription),
+            "Párrafo 1 Párrafo 2"
+        );
+        assert_eq!(
+            super::sanitize_text_for_mode("Párrafo 1\n\nPárrafo 2", super::DictationMode::Writing),
+            "Párrafo 1\n\nPárrafo 2"
+        );
+
+        // Insertion clipboard policy
+        assert!(super::insertion_uses_clipboard(super::DictationMode::Writing, false));
+        assert!(super::insertion_uses_clipboard(super::DictationMode::Writing, true));
+        assert!(super::insertion_uses_clipboard(super::DictationMode::Transcription, true));
+        assert!(!super::insertion_uses_clipboard(super::DictationMode::Transcription, false));
     }
     #[test]
     fn plain_text_sanitization_removes_newlines_tabs_and_dangerous_keycodes() {

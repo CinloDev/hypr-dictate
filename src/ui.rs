@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     io::{Seek, SeekFrom, Write},
     os::fd::AsFd,
+    process::{Command, Stdio},
     sync::mpsc,
     time::Duration,
 };
@@ -55,6 +56,7 @@ pub struct Ui {
     configured: bool,
     closed: bool,
     color: [u8; 3],
+    pub mode: hypr_dictate::DictationMode,
     pub models: Vec<String>,
     pub message: String,
     draft: crate::settings::Settings,
@@ -110,6 +112,7 @@ impl Ui {
             configured: false,
             closed: false,
             color: app.color(),
+            mode: app.mode,
             models: Vec::new(),
             message: "Cargando catálogo…".into(),
             draft: app.settings.clone(),
@@ -159,6 +162,7 @@ impl Ui {
             configured: false,
             closed: false,
             color: [120, 165, 136],
+            mode: hypr_dictate::DictationMode::Transcription,
             models: Vec::new(),
             message: String::new(),
             draft: crate::settings::Settings::default(),
@@ -269,7 +273,7 @@ impl Ui {
             preferences.close();
         }
     }
-    fn toggle_preferences(&mut self) {
+    pub fn toggle_preferences(&mut self) {
         if self.capturing_keyboard {
             return;
         }
@@ -361,6 +365,12 @@ impl Ui {
     }
     pub fn is_visible(&self) -> bool {
         self.layer.is_some()
+    }
+    pub fn set_mode(&mut self, mode: hypr_dictate::DictationMode) {
+        self.mode = mode;
+    }
+    pub fn draw_dock(&mut self, qh: &QueueHandle<Self>) -> Result<()> {
+        self.draw(qh)
     }
     pub fn arm(&mut self, address: String, dock_was_hidden: bool) {
         self.close_preferences();
@@ -511,6 +521,103 @@ impl Ui {
             chunk_result?;
         }
         Ok(())
+    }
+    pub fn trigger_paste(&mut self, address: &str, is_terminal: bool) -> Result<()> {
+        for _ in 0..100 {
+            if self.mods_depressed == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        let manager = self.manager.as_ref().context("Falta virtual keyboard manager")?;
+        let seat = self.seat.as_ref().context("Falta seat Wayland")?;
+
+        ensure!(
+            crate::active_address()? == address,
+            "Cambió el foco durante la inserción; inserción detenida"
+        );
+
+        let keyboard = manager.create_virtual_keyboard(seat, &self.qh, ());
+
+        let paste_result = (|| -> Result<()> {
+            let mut file = tempfile::tempfile()?;
+            file.write_all(PASTE_KEYMAP.as_bytes())?;
+            file.write_all(b"\0")?;
+            file.seek(SeekFrom::Start(0))?;
+            keyboard.keymap(1, file.as_fd(), (PASTE_KEYMAP.len() + 1) as u32);
+            keyboard.modifiers(0, 0, 0, 0);
+            self.connection.flush()?;
+            std::thread::sleep(Duration::from_millis(10));
+
+            ensure!(
+                crate::active_address()? == address,
+                "Cambió el foco durante la inserción; inserción detenida"
+            );
+
+            let (ctrl_code, shift_code, v_code) = (29, 42, 47);
+
+            if is_terminal {
+                keyboard.modifiers(5, 0, 0, 0);
+                keyboard.key(0, ctrl_code, 1);
+                keyboard.key(0, shift_code, 1);
+                self.connection.flush()?;
+                std::thread::sleep(Duration::from_millis(5));
+
+                keyboard.key(0, v_code, 1);
+                keyboard.key(0, v_code, 0);
+                self.connection.flush()?;
+                std::thread::sleep(Duration::from_millis(5));
+
+                keyboard.key(0, shift_code, 0);
+                keyboard.key(0, ctrl_code, 0);
+                keyboard.modifiers(0, 0, 0, 0);
+                self.connection.flush()?;
+            } else {
+                keyboard.modifiers(4, 0, 0, 0);
+                keyboard.key(0, ctrl_code, 1);
+                self.connection.flush()?;
+                std::thread::sleep(Duration::from_millis(5));
+
+                keyboard.key(0, v_code, 1);
+                keyboard.key(0, v_code, 0);
+                self.connection.flush()?;
+                std::thread::sleep(Duration::from_millis(5));
+
+                keyboard.key(0, ctrl_code, 0);
+                keyboard.modifiers(0, 0, 0, 0);
+                self.connection.flush()?;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            Ok(())
+        })();
+
+        keyboard.modifiers(0, 0, 0, 0);
+        keyboard.destroy();
+        let _ = self.connection.flush();
+        std::thread::sleep(Duration::from_millis(5));
+
+        paste_result
+    }
+    pub fn insert_text(
+        &mut self,
+        text: &str,
+        address: &str,
+        mode: hypr_dictate::DictationMode,
+    ) -> Result<()> {
+        let window = crate::query_window_info(address).ok();
+        let is_xwayland = window.as_ref().map(|w| w.xwayland).unwrap_or(false);
+        if hypr_dictate::insertion_uses_clipboard(mode, is_xwayland) {
+            copy_to_clipboard(text)?;
+            std::thread::sleep(Duration::from_millis(15));
+            let is_term = window
+                .as_ref()
+                .map(|w| crate::is_terminal_window(&w.class, &w.initial_class))
+                .unwrap_or(false);
+            self.trigger_paste(address, is_term)
+        } else {
+            self.type_text(text, address)
+        }
     }
 }
 impl Dispatch<wl_registry::WlRegistry, ()> for Ui {
@@ -839,7 +946,63 @@ fn monitor_width() -> Option<i32> {
     let monitor = value.as_array()?.iter().find(|m| m["focused"] == true)?;
     Some((monitor["width"].as_f64()? / monitor["scale"].as_f64().unwrap_or(1.)) as i32)
 }
-pub fn run(mut app: App, rx: mpsc::Receiver<Event>) -> Result<()> {
+pub const PASTE_KEYMAP: &str = "xkb_keymap {\n\
+    xkb_keycodes \"paste\" {\n\
+        minimum = 8;\n\
+        maximum = 255;\n\
+        <LCTL> = 37;\n\
+        <LFSH> = 50;\n\
+        <KV> = 55;\n\
+    };\n\
+    xkb_types \"paste\" {\n\
+        type \"ONE_LEVEL\" {\n\
+            modifiers = None;\n\
+            level_name[Level1] = \"Any\";\n\
+        };\n\
+        type \"TWO_LEVEL\" {\n\
+            modifiers = Shift;\n\
+            map[Shift] = Level2;\n\
+            level_name[Level1] = \"Base\";\n\
+            level_name[Level2] = \"Shift\";\n\
+        };\n\
+    };\n\
+    xkb_compatibility \"paste\" {\n\
+        interpret Control_L {\n\
+            action = SetMods(modifiers=Control);\n\
+        };\n\
+        interpret Shift_L {\n\
+            action = SetMods(modifiers=Shift);\n\
+        };\n\
+    };\n\
+    xkb_symbols \"paste\" {\n\
+        key <LCTL> { [ Control_L ] };\n\
+        key <LFSH> { [ Shift_L ] };\n\
+        key <KV> { [ v, V ] };\n\
+        modifier_map Control { <LCTL> };\n\
+        modifier_map Shift { <LFSH> };\n\
+    };\n\
+};\n";
+
+pub fn copy_to_clipboard(text: &str) -> Result<()> {
+    let mut child = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("No se pudo ejecutar wl-copy")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let output = child.wait_with_output()?;
+    ensure!(
+        output.status.success(),
+        "wl-copy falló: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+pub fn run(mut app: App, rx: mpsc::Receiver<Event>, initially_hidden: bool) -> Result<()> {
     let connection = Connection::connect_to_env().context("No se pudo conectar con Wayland")?;
     let mut queue = connection.new_event_queue();
     let qh = queue.handle();
@@ -872,7 +1035,9 @@ pub fn run(mut app: App, rx: mpsc::Receiver<Event>) -> Result<()> {
         &qh,
         (),
     ));
-    ui.setup_dock(&qh);
+    if !initially_hidden {
+        ui.setup_dock(&qh);
+    }
     queue.roundtrip(&mut ui)?;
     while !ui.closed {
         queue.dispatch_pending(&mut ui)?;
@@ -1115,5 +1280,60 @@ mod tests {
 
         let phrase = "Genial, funciona muy bien. Está perfecto, así que bueno, esto es una transcripción de prueba.";
         ui.type_text(phrase, address).expect("Ui::type_text original completó sin error");
+    }
+
+    #[test]
+    fn terminal_window_detection() {
+        assert!(crate::is_terminal_window("Alacritty", ""));
+        assert!(crate::is_terminal_window("kitty", ""));
+        assert!(crate::is_terminal_window("foot", ""));
+        assert!(crate::is_terminal_window("footclient", ""));
+        assert!(crate::is_terminal_window("com.mitchellh.ghostty", "Ghostty"));
+        assert!(crate::is_terminal_window("ghostty", ""));
+        assert!(crate::is_terminal_window("org.wezfurlong.wezterm", ""));
+        assert!(crate::is_terminal_window("wezterm", ""));
+        assert!(crate::is_terminal_window("wezterm-gui", ""));
+        assert!(crate::is_terminal_window("gnome-terminal", ""));
+        assert!(crate::is_terminal_window("konsole", ""));
+        assert!(crate::is_terminal_window("xfce4-terminal", ""));
+        assert!(crate::is_terminal_window("xterm", ""));
+        assert!(crate::is_terminal_window("st-256color", ""));
+        assert!(crate::is_terminal_window("my-custom-terminal", ""));
+
+        // Non-terminals
+        assert!(!crate::is_terminal_window("google-chrome", "Google-chrome"));
+        assert!(!crate::is_terminal_window("firefox", "Navigator"));
+        assert!(!crate::is_terminal_window("code", "Code"));
+        assert!(!crate::is_terminal_window("gedit", "org.gnome.gedit"));
+        assert!(!crate::is_terminal_window("slack", "Slack"));
+    }
+
+    #[test]
+    fn paste_keymap_compiles_cleanly() {
+        let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_string(
+            &ctx,
+            PASTE_KEYMAP.to_string(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        );
+        assert!(
+            keymap.is_some(),
+            "PASTE_KEYMAP must compile cleanly with xkbcommon"
+        );
+    }
+
+    #[test]
+    fn insertion_mode_dispatch_policy() {
+        use hypr_dictate::{DictationMode, insertion_uses_clipboard};
+
+        // Transcription on native Wayland -> keymap typing (false)
+        assert!(!insertion_uses_clipboard(DictationMode::Transcription, false));
+        // Transcription on XWayland -> clipboard paste (true)
+        assert!(insertion_uses_clipboard(DictationMode::Transcription, true));
+
+        // Writing mode -> always clipboard paste (true)
+        assert!(insertion_uses_clipboard(DictationMode::Writing, false));
+        assert!(insertion_uses_clipboard(DictationMode::Writing, true));
     }
 }

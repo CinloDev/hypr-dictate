@@ -21,6 +21,7 @@ use std::{
     time::Duration,
 };
 
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     Command(String),
     Ping(mpsc::SyncSender<()>),
@@ -40,6 +41,7 @@ struct Capture {
 }
 pub struct App {
     phase: Phase,
+    pub mode: hypr_dictate::DictationMode,
     capture: Option<Capture>,
     lifecycle: hypr_dictate::KeyLifecycle,
     recording_started: Option<std::time::Instant>,
@@ -54,11 +56,19 @@ pub struct App {
 }
 impl App {
     pub fn color(&self) -> [u8; 3] {
-        match self.phase {
-            Phase::Idle => [120, 165, 136],
-            Phase::Recording(_) => [240, 151, 138],
-            Phase::Processing(_) => [224, 194, 122],
-            Phase::Error => [240, 151, 138],
+        match self.mode {
+            hypr_dictate::DictationMode::Transcription => match self.phase {
+                Phase::Idle => [120, 165, 136],
+                Phase::Recording(_) => [240, 151, 138],
+                Phase::Processing(_) => [224, 194, 122],
+                Phase::Error => [240, 151, 138],
+            },
+            hypr_dictate::DictationMode::Writing => match self.phase {
+                Phase::Idle => [120, 165, 136],
+                Phase::Recording(_) => [61, 148, 245],
+                Phase::Processing(_) => [90, 180, 255],
+                Phase::Error => [240, 151, 138],
+            },
         }
     }
     fn discard_capture(&mut self) {
@@ -69,7 +79,7 @@ impl App {
             let _ = capture.errors.join();
         }
     }
-    fn start(&mut self, ui: &mut ui::Ui) -> Result<()> {
+    fn start(&mut self, ui: &mut ui::Ui, mode: hypr_dictate::DictationMode) -> Result<()> {
         if !matches!(self.phase, Phase::Idle | Phase::Error) {
             return Ok(());
         }
@@ -82,6 +92,9 @@ impl App {
         // Capturar ventana enfocada ANTES del foco exclusivo de layer-shell
         let address = active_address()?;
         ensure!(valid_address(&address), "No hay ventana enfocada válida");
+
+        self.mode = mode;
+        ui.set_mode(mode);
 
         let dock_was_hidden = !ui.is_visible();
         if dock_was_hidden {
@@ -218,6 +231,8 @@ impl App {
         self.discard_capture();
         self.lifecycle.cancel();
         self.phase = Phase::Idle;
+        self.mode = hypr_dictate::DictationMode::Transcription;
+        ui.set_mode(hypr_dictate::DictationMode::Transcription);
         ui.level = 0.;
         ui.message = "Dictado cancelado".into();
         ui.dirty = true;
@@ -239,9 +254,10 @@ impl App {
         let client = self.client.clone();
         let key = self.key.clone();
         let endpoint = self.endpoint.clone();
-        let model = self.settings.model.clone();
+        let mode = self.mode;
+        let model = self.settings.model_for(mode).to_string();
         let temperature = self.settings.temperature;
-        let prompt = self.settings.prompt.clone();
+        let prompt = self.settings.prompt_for(mode).to_string();
         let generation = self.lifecycle.generation;
         thread::spawn(move || {
             let result = (|| -> Result<(String, String)> {
@@ -295,12 +311,13 @@ impl App {
                     response["choices"][0]["finish_reason"] == "stop",
                     "Respuesta incompleta; no se insertó texto"
                 );
-                let text = response["choices"][0]["message"]["content"]
+                let raw = response["choices"][0]["message"]["content"]
                     .as_str()
                     .context("API sin transcripción")?
                     .trim()
                     .to_owned();
-                ensure!(text.len() <= 100_000, "Transcripción demasiado grande");
+                ensure!(raw.len() <= 100_000, "Transcripción demasiado grande");
+                let text = hypr_dictate::sanitize_text_for_mode(&raw, mode);
                 Ok((address, text))
             })();
             let _ = tx.send(Event::Finished(generation, result));
@@ -387,11 +404,13 @@ impl App {
                         if let Some((address, text)) = self.lifecycle.take_deferred() {
                             let restore_res = restore(&address);
                             let type_res = if restore_res.is_ok() && !text.is_empty() {
-                                ui.type_text(&text, &address)
+                                ui.insert_text(&text, &address, self.mode)
                             } else {
                                 Ok(())
                             };
                             self.phase = Phase::Idle;
+                            self.mode = hypr_dictate::DictationMode::Transcription;
+                            ui.set_mode(hypr_dictate::DictationMode::Transcription);
                             if self.lifecycle.dock_temporarily_shown {
                                 ui.hide();
                                 self.lifecycle.dock_temporarily_shown = false;
@@ -417,6 +436,8 @@ impl App {
                             ui.hide();
                             self.lifecycle.dock_temporarily_shown = false;
                         }
+                        self.mode = hypr_dictate::DictationMode::Transcription;
+                        ui.set_mode(hypr_dictate::DictationMode::Transcription);
                         self.lifecycle.cancel();
                     }
                     _ => {}
@@ -434,6 +455,8 @@ impl App {
                         }
                         self.lifecycle.cancel();
                         self.phase = Phase::Idle;
+                        self.mode = hypr_dictate::DictationMode::Transcription;
+                        ui.set_mode(hypr_dictate::DictationMode::Transcription);
                         self.error.clear();
                         ui.level = 0.;
                         ui.message = "Dock reiniciado".into();
@@ -455,7 +478,25 @@ impl App {
                             self.lifecycle.waiting_release = None;
                             self.stop()
                         } else {
-                            self.start(ui)
+                            self.start(ui, hypr_dictate::DictationMode::Transcription)
+                        }
+                    }
+                    "start-formal" => {
+                        if matches!(self.phase, Phase::Processing(_)) {
+                            self.cancel(ui)?;
+                            ui.capture_keyboard(false);
+                            if self.lifecycle.dock_temporarily_shown {
+                                ui.hide();
+                            }
+                            self.lifecycle.cancel();
+                            Ok(())
+                        } else if matches!(self.phase, Phase::Recording(_)) {
+                            ui.capture_keyboard(false);
+                            self.lifecycle.is_recording = false;
+                            self.lifecycle.waiting_release = None;
+                            self.stop()
+                        } else {
+                            self.start(ui, hypr_dictate::DictationMode::Writing)
                         }
                     }
                     "stop" => {
@@ -483,7 +524,7 @@ impl App {
                             self.lifecycle.waiting_release = None;
                             self.stop()
                         } else {
-                            self.start(ui)
+                            self.start(ui, hypr_dictate::DictationMode::Transcription)
                         }
                     }
                     "toggle-ui" => {
@@ -494,6 +535,10 @@ impl App {
                             self.lifecycle.cancel();
                         }
                         ui.toggle_visibility();
+                        Ok(())
+                    }
+                    "preferences" => {
+                        ui.toggle_preferences();
                         Ok(())
                     }
                     _ => Ok(()),
@@ -574,6 +619,8 @@ impl App {
                                     self.lifecycle.dock_temporarily_shown = false;
                                 }
                                 self.phase = Phase::Error;
+                                self.mode = hypr_dictate::DictationMode::Transcription;
+                                ui.set_mode(hypr_dictate::DictationMode::Transcription);
                                 ui.message = e.to_string();
                                 ui.dirty = true;
                                 self.lifecycle.cancel();
@@ -591,11 +638,13 @@ impl App {
                                 ui.capture_keyboard(false);
                                 let restore_res = restore(&address);
                                 let type_res = if restore_res.is_ok() && !text.is_empty() {
-                                    ui.type_text(&text, &address)
+                                    ui.insert_text(&text, &address, self.mode)
                                 } else {
                                     Ok(())
                                 };
                                 self.phase = Phase::Idle;
+                                self.mode = hypr_dictate::DictationMode::Transcription;
+                                ui.set_mode(hypr_dictate::DictationMode::Transcription);
                                 if self.lifecycle.dock_temporarily_shown {
                                     ui.hide();
                                     self.lifecycle.dock_temporarily_shown = false;
@@ -754,6 +803,75 @@ fn restore(address: &str) -> Result<()> {
     }
     bail!("No se pudo restaurar el foco; no se insertó texto")
 }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowInfo {
+    pub address: String,
+    pub class: String,
+    pub initial_class: String,
+    pub xwayland: bool,
+}
+
+pub fn is_terminal_window(class: &str, initial_class: &str) -> bool {
+    let check = |name: &str| -> bool {
+        let lower = name.to_ascii_lowercase();
+        lower == "alacritty"
+            || lower == "kitty"
+            || lower == "foot"
+            || lower == "footclient"
+            || lower == "com.mitchellh.ghostty"
+            || lower == "ghostty"
+            || lower == "org.wezfurlong.wezterm"
+            || lower == "wezterm"
+            || lower == "wezterm-gui"
+            || lower == "contour"
+            || lower == "rio"
+            || lower.contains("terminal")
+            || lower.ends_with(".terminal")
+            || lower == "gnome-terminal"
+            || lower == "konsole"
+            || lower == "xfce4-terminal"
+            || lower == "lxterminal"
+            || lower == "xterm"
+            || lower == "urxvt"
+            || lower == "st"
+            || lower == "st-256color"
+            || lower == "terminator"
+            || lower == "tilix"
+    };
+    check(class) || check(initial_class)
+}
+
+pub fn query_window_info(address: &str) -> Result<WindowInfo> {
+    if let Ok(bytes) = hypr(&["-j", "activewindow"])
+        && let Ok(val) = serde_json::from_slice::<Value>(&bytes)
+        && val["address"].as_str() == Some(address)
+    {
+        return Ok(WindowInfo {
+            address: address.to_string(),
+            class: val["class"].as_str().unwrap_or("").to_string(),
+            initial_class: val["initialClass"].as_str().unwrap_or("").to_string(),
+            xwayland: val["xwayland"].as_bool().unwrap_or(false),
+        });
+    }
+
+    let clients_bytes = hypr(&["-j", "clients"])?;
+    let clients: Value = serde_json::from_slice(&clients_bytes)?;
+    if let Some(arr) = clients.as_array() {
+        for client in arr {
+            if client["address"].as_str() == Some(address) {
+                return Ok(WindowInfo {
+                    address: address.to_string(),
+                    class: client["class"].as_str().unwrap_or("").to_string(),
+                    initial_class: client["initialClass"].as_str().unwrap_or("").to_string(),
+                    xwayland: client["xwayland"].as_bool().unwrap_or(false),
+                });
+            }
+        }
+    }
+    bail!("Ventana objetivo no encontrada")
+}
+
 fn socket_path() -> Result<PathBuf> {
     let runtime =
         PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("Falta XDG_RUNTIME_DIR")?);
@@ -765,10 +883,22 @@ fn socket_path() -> Result<PathBuf> {
     Ok(runtime.join("hypr-dictate.sock"))
 }
 pub fn is_valid_command(cmd: &str) -> bool {
-    ["start", "stop", "toggle", "toggle-ui", "reload", "reset"].contains(&cmd)
+    [
+        "start",
+        "start-formal",
+        "stop",
+        "toggle",
+        "toggle-ui",
+        "preferences",
+        "reload",
+        "reset",
+        "--help",
+        "-h",
+    ]
+    .contains(&cmd)
 }
 
-fn launch_background(path: &std::path::Path) -> Result<()> {
+fn launch_background(path: &std::path::Path, hidden: bool) -> Result<()> {
     let exe = std::env::current_exe().context("No se pudo determinar el ejecutable actual")?;
     let key = std::env::var("CLIPROXYAPI_API_KEY").context("Falta CLIPROXYAPI_API_KEY")?;
     ensure!(!key.is_empty(), "CLIPROXYAPI_API_KEY está vacía");
@@ -777,8 +907,11 @@ fn launch_background(path: &std::path::Path) -> Result<()> {
     let mut stderr_read = stderr_file.try_clone()?;
 
     let mut cmd = Command::new(exe);
-    cmd.arg("run")
-        .stdin(Stdio::null())
+    cmd.arg("run");
+    if hidden {
+        cmd.arg("--hidden");
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file));
     #[cfg(unix)]
@@ -833,11 +966,15 @@ fn launch_background(path: &std::path::Path) -> Result<()> {
 
 fn main() -> Result<()> {
     let command = std::env::args().nth(1).unwrap_or_else(|| "run".into());
+    if command == "--help" || command == "-h" {
+        println!("Uso: hypr-dictate [run|start|start-formal|stop|toggle|toggle-ui|preferences|reload|reset|--help]");
+        return Ok(());
+    }
     let path = socket_path()?;
     if command != "run" {
         ensure!(
             is_valid_command(&command),
-            "Uso: hypr-dictate [run|start|stop|toggle|toggle-ui|reload|reset]"
+            "Uso: hypr-dictate [run|start|start-formal|stop|toggle|toggle-ui|preferences|reload|reset|--help]"
         );
         if command == "toggle-ui" {
             match UnixStream::connect(&path) {
@@ -847,7 +984,7 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    launch_background(&path)?;
+                    launch_background(&path, false)?;
                     return Ok(());
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
@@ -864,6 +1001,14 @@ fn main() -> Result<()> {
 
         match UnixStream::connect(&path) {
             Ok(mut stream) => {
+                stream.write_all(command.as_bytes())?;
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                return Ok(());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && (command == "start" || command == "start-formal") => {
+                launch_background(&path, true)?;
+                let mut stream = UnixStream::connect(&path)
+                    .context("No se pudo conectar al socket tras iniciar en segundo plano")?;
                 stream.write_all(command.as_bytes())?;
                 let _ = stream.shutdown(std::net::Shutdown::Write);
                 return Ok(());
@@ -919,13 +1064,14 @@ fn main() -> Result<()> {
     });
     let mut app = App {
         phase: Phase::Idle,
+        mode: hypr_dictate::DictationMode::Transcription,
         capture: None,
         lifecycle: hypr_dictate::KeyLifecycle::new(),
         recording_started: None,
         catalog_generation: 0,
         tx,
         client: reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(25))
+            .timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
@@ -936,7 +1082,8 @@ fn main() -> Result<()> {
         error: String::new(),
     };
     app.request_catalog();
-    ui::run(app, rx)
+    let hidden = std::env::args().any(|arg| arg == "--hidden");
+    ui::run(app, rx, hidden)
 }
 
 #[cfg(test)]
@@ -947,6 +1094,7 @@ mod tests {
         let (tx, _) = mpsc::channel();
         App {
             phase,
+            mode: hypr_dictate::DictationMode::Transcription,
             capture: None,
             lifecycle: hypr_dictate::KeyLifecycle::new(),
             recording_started: None,
@@ -967,9 +1115,11 @@ mod tests {
     #[test]
     fn validates_supported_cli_commands() {
         assert!(is_valid_command("start"));
+        assert!(is_valid_command("start-formal"));
         assert!(is_valid_command("stop"));
         assert!(is_valid_command("toggle"));
         assert!(is_valid_command("toggle-ui"));
+        assert!(is_valid_command("preferences"));
         assert!(is_valid_command("reload"));
         assert!(is_valid_command("reset"));
         assert!(!is_valid_command("unknown"));
@@ -978,8 +1128,42 @@ mod tests {
 
     #[test]
     fn command_length_fits_socket_read_budget() {
+        assert!("start-formal".len() <= 16);
         assert!("toggle-ui".len() <= 16);
         assert!("toggle".len() <= 16);
+    }
+
+    #[test]
+    fn writing_mode_app_colors_and_ipc_dispatch() {
+        let mut app = app(Phase::Idle);
+        assert_eq!(app.mode, hypr_dictate::DictationMode::Transcription);
+        app.mode = hypr_dictate::DictationMode::Writing;
+        app.phase = Phase::Recording("0x123".into());
+        assert_eq!(app.color(), [61, 148, 245]);
+        app.phase = Phase::Processing("0x123".into());
+        assert_eq!(app.color(), [90, 180, 255]);
+
+        // Model and prompt dispatch per mode
+        app.settings.model = "legacy-transcription-model".into();
+        app.settings.prompt = "Transcription prompt".into();
+        app.settings.writing_model = "pro-writing-model".into();
+        app.settings.writing_prompt = "Professional writing prompt".into();
+
+        app.mode = hypr_dictate::DictationMode::Transcription;
+        assert_eq!(app.settings.model_for(app.mode), "legacy-transcription-model");
+        assert_eq!(app.settings.prompt_for(app.mode), "Transcription prompt");
+
+        app.mode = hypr_dictate::DictationMode::Writing;
+        assert_eq!(app.settings.model_for(app.mode), "pro-writing-model");
+        assert_eq!(app.settings.prompt_for(app.mode), "Professional writing prompt");
+    }
+
+    #[test]
+    fn usage_message_and_cli_contain_start_formal() {
+        let usage = "Uso: hypr-dictate [run|start|start-formal|stop|toggle|toggle-ui|preferences|reload|reset|--help]";
+        assert!(usage.contains("start-formal"));
+        assert!(is_valid_command("start-formal"));
+        assert!(is_valid_command("--help"));
     }
 
     #[test]
@@ -987,6 +1171,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let app = App {
             phase: Phase::Idle,
+            mode: hypr_dictate::DictationMode::Transcription,
             capture: None,
             lifecycle: hypr_dictate::KeyLifecycle::new(),
             recording_started: None,
@@ -1211,7 +1396,7 @@ mod tests {
     fn transcription_retains_default_client_timeout() {
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
-            .timeout(Duration::from_secs(25))
+            .timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(5))
             .build()
             .unwrap();
@@ -1221,13 +1406,13 @@ mod tests {
         assert_eq!(
             request.timeout(),
             None,
-            "transcription must retain the 25s client default"
+            "transcription must retain the 120s client default"
         );
         let catalog = client.get("http://127.0.0.1/v1/models").build().unwrap();
         assert_eq!(
             catalog.timeout(),
             None,
-            "catalog must retain the 25s client default"
+            "catalog must retain the 120s client default"
         );
     }
 
@@ -1288,6 +1473,7 @@ mod tests {
                 monitor: "saved-monitor".into(),
                 temperature: 0.7,
                 prompt: "saved prompt".into(),
+                ..Default::default()
             };
             let mut expected = app.settings.clone();
             expected.x = 456;
