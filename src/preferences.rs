@@ -104,10 +104,102 @@ impl Draft {
             self.settings.model = model.into();
         }
     }
+    fn choose_writing_model(&mut self, model: &str) {
+        if !model.is_empty() {
+            self.settings.writing_model = model.into();
+        }
+    }
     fn server_saved(&mut self, url: &str) {
         self.settings.base_url = url.into();
         self.models.clear();
     }
+}
+
+pub fn is_modifier_key(key: gtk::gdk::Key) -> bool {
+    matches!(
+        key,
+        gtk::gdk::Key::Shift_L
+            | gtk::gdk::Key::Shift_R
+            | gtk::gdk::Key::Control_L
+            | gtk::gdk::Key::Control_R
+            | gtk::gdk::Key::Alt_L
+            | gtk::gdk::Key::Alt_R
+            | gtk::gdk::Key::Super_L
+            | gtk::gdk::Key::Super_R
+            | gtk::gdk::Key::Meta_L
+            | gtk::gdk::Key::Meta_R
+            | gtk::gdk::Key::Hyper_L
+            | gtk::gdk::Key::Hyper_R
+            | gtk::gdk::Key::ISO_Level3_Shift
+            | gtk::gdk::Key::Caps_Lock
+            | gtk::gdk::Key::Num_Lock
+    )
+}
+
+pub fn parse_gtk_key(
+    state: gtk::gdk::ModifierType,
+    key: gtk::gdk::Key,
+) -> Result<crate::shortcut::ShortcutSpec, &'static str> {
+    if key == gtk::gdk::Key::Escape {
+        return Err("cancel");
+    }
+    if key == gtk::gdk::Key::BackSpace || key == gtk::gdk::Key::Delete {
+        return Err("clear");
+    }
+    if is_modifier_key(key) {
+        return Err("modifier_only");
+    }
+
+    let key_name = match key {
+        gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter => "Return".to_string(),
+        gtk::gdk::Key::space => "Space".to_string(),
+        _ => {
+            if let Some(name) = key.name() {
+                let s = name.as_str();
+                if s.len() == 1 {
+                    s.to_ascii_uppercase()
+                } else {
+                    s.to_string()
+                }
+            } else {
+                return Err("unknown_key");
+            }
+        }
+    };
+
+    let mut mods = Vec::new();
+    if state.contains(gtk::gdk::ModifierType::SUPER_MASK) {
+        mods.push("SUPER".to_string());
+    }
+    if state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+        mods.push("CTRL".to_string());
+    }
+    if state.contains(gtk::gdk::ModifierType::ALT_MASK) {
+        mods.push("ALT".to_string());
+    }
+    if state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+        mods.push("SHIFT".to_string());
+    }
+    mods.sort();
+
+    Ok(crate::shortcut::ShortcutSpec {
+        modifiers: mods,
+        key: key_name,
+    })
+}
+
+pub fn validate_shortcuts(
+    transcription: Option<&crate::shortcut::ShortcutSpec>,
+    writing: Option<&crate::shortcut::ShortcutSpec>,
+) -> Result<(), &'static str> {
+    if let (Some(t), Some(w)) = (transcription, writing)
+        && !t.key.is_empty()
+        && !w.key.is_empty()
+        && t.conflicts_with(w)
+    {
+        return Err("Los atajos para transcripción y redacción entran en conflicto");
+    }
+    Ok(())
 }
 fn account_of(model: &str) -> &str {
     model.split_once('/').map_or("", |(account, _)| account)
@@ -123,11 +215,16 @@ struct Widgets {
     window: gtk::ApplicationWindow,
     account: gtk::DropDown,
     model: gtk::DropDown,
+    writing_model: gtk::DropDown,
     shortcut: gtk::DropDown,
+    writing_shortcut_btn: gtk::Button,
+    writing_shortcut: RefCell<Option<crate::shortcut::ShortcutSpec>>,
+    capturing_writing_shortcut: Cell<bool>,
     microphone: gtk::DropDown,
     monitor: gtk::DropDown,
     temperature: gtk::SpinButton,
     prompt: gtk::TextView,
+    writing_prompt: gtk::TextView,
     url: gtk::Entry,
     status: gtk::Label,
     data: RefCell<Draft>,
@@ -233,6 +330,15 @@ impl Preferences {
         let general = page();
         let account = dropdown();
         let model = dropdown();
+        let model_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        model_box.append(&model);
+        let refresh_models = button(
+            "view-refresh-symbolic",
+            "Actualizar",
+            "Recarga el catálogo de modelos desde el servidor.",
+        );
+        model_box.append(&refresh_models);
+
         let shortcut = gtk::DropDown::from_strings(&[
             "Sin atajo",
             SHORTCUTS[1],
@@ -256,7 +362,7 @@ impl Preferences {
             "applications-science-symbolic",
             "Modelo",
             "Selecciona explícitamente un modelo que acepte audio.",
-            &model,
+            &model_box,
         );
         row(
             &general,
@@ -285,6 +391,83 @@ impl Preferences {
             .vexpand(true)
             .build();
         stack.add_titled(&general_scroll, Some("general"), "General");
+
+        let writing = page();
+        let writing_model = dropdown();
+        let writing_model_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        writing_model_box.append(&writing_model);
+        let refresh_writing_models = button(
+            "view-refresh-symbolic",
+            "Actualizar",
+            "Recarga el catálogo de modelos desde el servidor.",
+        );
+        writing_model_box.append(&refresh_writing_models);
+        row(
+            &writing,
+            "applications-science-symbolic",
+            "Modelo de Redacción",
+            "Modelo inteligente utilizado para redacción pro (ej. gemini-2.5-flash).",
+            &writing_model_box,
+        );
+
+        let writing_shortcut_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let writing_shortcut_btn = gtk::Button::builder()
+            .hexpand(true)
+            .tooltip_text("Haz clic para asignar un atajo por pulsación de teclas.")
+            .build();
+        let clear_writing_shortcut = button(
+            "edit-clear-symbolic",
+            "Sin atajo",
+            "Elimina el atajo asignado a la redacción pro.",
+        );
+        writing_shortcut_box.append(&writing_shortcut_btn);
+        writing_shortcut_box.append(&clear_writing_shortcut);
+        row(
+            &writing,
+            "input-keyboard-symbolic",
+            "Atajo de Redacción (start-formal)",
+            "Dispara el modo redacción pro; pulsa Enter para transcribir o Escape para cancelar.",
+            &writing_shortcut_box,
+        );
+
+        let writing_prompt_label = gtk::Label::new(Some("Prompt de Redacción"));
+        writing_prompt_label.set_xalign(0.);
+        writing_prompt_label.add_css_class("heading");
+        writing.append(&writing_prompt_label);
+        let writing_prompt = gtk::TextView::builder()
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .monospace(true)
+            .left_margin(12)
+            .right_margin(12)
+            .top_margin(12)
+            .bottom_margin(12)
+            .accepts_tab(false)
+            .vexpand(true)
+            .build();
+        writing_prompt_label.set_mnemonic_widget(Some(&writing_prompt));
+        writing_prompt.buffer().set_enable_undo(true);
+        let writing_scroll_view = gtk::ScrolledWindow::builder()
+            .child(&writing_prompt)
+            .vexpand(true)
+            .min_content_height(180)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .has_frame(true)
+            .build();
+        writing.append(&writing_scroll_view);
+        let restore_writing = button(
+            "edit-undo-symbolic",
+            "Restaurar prompt de redacción",
+            "Restaura el prompt de redacción a los valores predeterminados.",
+        );
+        restore_writing.set_halign(gtk::Align::Start);
+        writing.append(&restore_writing);
+
+        let writing_scroll = gtk::ScrolledWindow::builder()
+            .child(&writing)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build();
+        stack.add_titled(&writing_scroll, Some("writing"), "Redacción Pro");
 
         let ai = page();
         let temperature = gtk::SpinButton::with_range(0., 1., 0.05);
@@ -398,6 +581,10 @@ impl Preferences {
         keys.connect_key_pressed(move |_, key, _, _| {
             if key == gtk::gdk::Key::Escape {
                 if let Some(window) = weak_window.upgrade() {
+                    if gtk4_layer_shell::is_supported() {
+                        window.set_exclusive_zone(0);
+                    }
+                    window.set_visible(false);
                     window.destroy();
                 }
                 gtk::glib::Propagation::Stop
@@ -407,6 +594,10 @@ impl Preferences {
         });
         window.add_controller(keys);
         window.connect_close_request(|win| {
+            if gtk4_layer_shell::is_supported() {
+                win.set_exclusive_zone(0);
+            }
+            win.set_visible(false);
             win.destroy();
             gtk::glib::Propagation::Proceed
         });
@@ -415,11 +606,16 @@ impl Preferences {
             window,
             account,
             model,
+            writing_model,
             shortcut,
+            writing_shortcut_btn,
+            writing_shortcut: RefCell::new(settings.writing_shortcut.clone()),
+            capturing_writing_shortcut: Cell::new(false),
             microphone,
             monitor,
             temperature,
             prompt,
+            writing_prompt,
             url,
             status,
             data: RefCell::new(Draft::new(settings, models)),
@@ -460,9 +656,105 @@ impl Preferences {
             }
         });
         let weak = Rc::downgrade(&widgets);
+        widgets.writing_model.connect_selected_notify(move |_| {
+            if let Some(w) = weak.upgrade()
+                && !w.updating.get()
+            {
+                let selected_model = w.writing_model_selected();
+                w.data.borrow_mut().choose_writing_model(&selected_model);
+            }
+        });
+        let weak = Rc::downgrade(&widgets);
+        refresh_models.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.status.set_text("Actualizando catálogo de modelos…");
+                let _ = w.tx.send(Event::SaveServer(w.url.text().into()));
+            }
+        });
+        let weak = Rc::downgrade(&widgets);
+        refresh_writing_models.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.status.set_text("Actualizando catálogo de modelos…");
+                let _ = w.tx.send(Event::SaveServer(w.url.text().into()));
+            }
+        });
+        let weak = Rc::downgrade(&widgets);
+        let key_ctrl = gtk::EventControllerKey::new();
+        key_ctrl.connect_key_pressed(move |_, key, _, state| {
+            if let Some(w) = weak.upgrade() {
+                if !w.capturing_writing_shortcut.get() {
+                    return gtk::glib::Propagation::Proceed;
+                }
+                match parse_gtk_key(state, key) {
+                    Ok(spec) => {
+                        w.capturing_writing_shortcut.set(false);
+                        *w.writing_shortcut.borrow_mut() = Some(spec);
+                        w.update_writing_shortcut_label();
+                        gtk::glib::Propagation::Stop
+                    }
+                    Err("cancel") => {
+                        w.capturing_writing_shortcut.set(false);
+                        w.update_writing_shortcut_label();
+                        gtk::glib::Propagation::Stop
+                    }
+                    Err("clear") => {
+                        w.capturing_writing_shortcut.set(false);
+                        *w.writing_shortcut.borrow_mut() = None;
+                        w.update_writing_shortcut_label();
+                        gtk::glib::Propagation::Stop
+                    }
+                    Err("modifier_only") => gtk::glib::Propagation::Proceed,
+                    _ => gtk::glib::Propagation::Proceed,
+                }
+            } else {
+                gtk::glib::Propagation::Proceed
+            }
+        });
+        widgets.writing_shortcut_btn.add_controller(key_ctrl);
+
+        let weak = Rc::downgrade(&widgets);
+        widgets.writing_shortcut_btn.connect_clicked(move |btn| {
+            if let Some(w) = weak.upgrade() {
+                if w.capturing_writing_shortcut.get() {
+                    w.capturing_writing_shortcut.set(false);
+                    w.update_writing_shortcut_label();
+                } else {
+                    w.capturing_writing_shortcut.set(true);
+                    btn.set_label("Presiona un atajo… (Esc cancela)");
+                }
+            }
+        });
+
+        let weak = Rc::downgrade(&widgets);
+        clear_writing_shortcut.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.capturing_writing_shortcut.set(false);
+                *w.writing_shortcut.borrow_mut() = None;
+                w.update_writing_shortcut_label();
+            }
+        });
+
+        let weak = Rc::downgrade(&widgets);
         save.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
-                let _ = w.tx.send(Event::Save(w.snapshot()));
+                let snapshot = w.snapshot();
+                if let Err(err_msg) = validate_shortcuts(
+                    snapshot.transcription_shortcut.as_ref(),
+                    snapshot.writing_shortcut.as_ref(),
+                ) {
+                    w.status.set_text(err_msg);
+                    return;
+                }
+                let exe = std::env::current_exe()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("hypr-dictate"));
+                if let Err(e) = crate::shortcut::apply_hyprland_shortcuts(
+                    snapshot.transcription_shortcut.as_ref(),
+                    snapshot.writing_shortcut.as_ref(),
+                    &exe,
+                ) {
+                    w.status.set_text(&format!("Error al configurar atajos: {e}"));
+                }
+                let _ = w.tx.send(Event::Save(snapshot));
             }
         });
         let weak = Rc::downgrade(&widgets);
@@ -474,6 +766,10 @@ impl Preferences {
         let weak = Rc::downgrade(&widgets);
         close.connect_clicked(move |_| {
             if let Some(w) = weak.upgrade() {
+                if gtk4_layer_shell::is_supported() {
+                    w.window.set_exclusive_zone(0);
+                }
+                w.window.set_visible(false);
                 w.window.destroy();
             }
         });
@@ -487,12 +783,27 @@ impl Preferences {
                 );
             }
         });
+        let weak = Rc::downgrade(&widgets);
+        restore_writing.connect_clicked(move |_| {
+            if let Some(w) = weak.upgrade() {
+                w.writing_prompt
+                    .buffer()
+                    .set_text(settings::DEFAULT_WRITING_PROMPT);
+                w.status.set_text(
+                    "Prompt de redacción restaurado en el borrador; pulsa Guardar cambios para aplicarlo.",
+                );
+            }
+        });
         Ok(Self(widgets))
     }
     pub fn present(&self) {
         self.0.window.present();
     }
     pub fn close(&self) {
+        if gtk4_layer_shell::is_supported() {
+            self.0.window.set_exclusive_zone(0);
+        }
+        self.0.window.set_visible(false);
         self.0.window.destroy();
     }
     pub fn visible(&self) -> bool {
@@ -506,22 +817,37 @@ impl Preferences {
     pub fn catalog_loaded(&self, models: &[String]) {
         self.0.data.borrow_mut().models = models.to_vec();
         self.0.rebuild_accounts();
+        self.0.rebuild_writing_models();
     }
     pub fn server_saved(&self, base_url: &str) {
         self.0.data.borrow_mut().server_saved(base_url);
         self.0.url.set_text(base_url);
         self.0.rebuild_accounts();
+        self.0.rebuild_writing_models();
     }
     pub fn position_saved(&self, x: i32) {
         self.0.data.borrow_mut().settings.x = x;
     }
 }
 impl Widgets {
+    fn update_writing_shortcut_label(&self) {
+        let sc = self.writing_shortcut.borrow();
+        let text = match sc.as_ref() {
+            Some(spec) if !spec.key.is_empty() => spec.to_binding_string(),
+            _ => "Sin atajo (clic para asignar)".to_string(),
+        };
+        self.writing_shortcut_btn.set_label(&text);
+    }
     fn load(&self) {
         let data = self.data.borrow();
         self.url.set_text(&data.settings.base_url);
         self.temperature.set_value(data.settings.temperature);
         self.prompt.buffer().set_text(&data.settings.prompt);
+        self.writing_prompt
+            .buffer()
+            .set_text(&data.settings.writing_prompt);
+        *self.writing_shortcut.borrow_mut() = data.settings.writing_shortcut.clone();
+        self.update_writing_shortcut_label();
         self.shortcut.set_selected(
             SHORTCUTS
                 .iter()
@@ -552,6 +878,7 @@ impl Widgets {
         );
         drop(data);
         self.rebuild_accounts();
+        self.rebuild_writing_models();
     }
     fn rebuild_accounts(&self) {
         self.updating.set(true);
@@ -585,12 +912,54 @@ impl Widgets {
         set_options(&self.model, &labels, index);
         self.updating.set(false);
     }
+    fn rebuild_writing_models(&self) {
+        self.updating.set(true);
+        let data = self.data.borrow();
+        let mut models = data.models.clone();
+        if !data.settings.writing_model.is_empty()
+            && !models.iter().any(|m| m == &data.settings.writing_model)
+        {
+            models.push(data.settings.writing_model.clone());
+            models.sort();
+        }
+        let index = models
+            .iter()
+            .position(|model| model == &data.settings.writing_model)
+            .map_or(0, |i| i as u32 + 1);
+        let mut labels = vec!["Selecciona un modelo de redacción…".to_owned()];
+        labels.extend(models);
+        set_options(&self.writing_model, &labels, index);
+        self.updating.set(false);
+    }
+    fn writing_model_selected(&self) -> String {
+        let data = self.data.borrow();
+        let mut models = data.models.clone();
+        if !data.settings.writing_model.is_empty()
+            && !models.iter().any(|m| m == &data.settings.writing_model)
+        {
+            models.push(data.settings.writing_model.clone());
+            models.sort();
+        }
+        self.writing_model
+            .selected()
+            .checked_sub(1)
+            .and_then(|i| models.get(i as usize))
+            .cloned()
+            .unwrap_or_else(|| data.settings.writing_model.clone())
+    }
     fn snapshot(&self) -> Settings {
         let mut settings = self.data.borrow().settings.clone();
         settings.shortcut = SHORTCUTS
             .get(self.shortcut.selected() as usize)
             .unwrap_or(&"")
             .to_string();
+        settings.transcription_shortcut = crate::shortcut::ShortcutSpec::parse(&settings.shortcut);
+        settings.writing_shortcut = self.writing_shortcut.borrow().clone();
+        settings.writing_model = self.writing_model_selected();
+        let writing_buffer = self.writing_prompt.buffer();
+        settings.writing_prompt = writing_buffer
+            .text(&writing_buffer.start_iter(), &writing_buffer.end_iter(), true)
+            .into();
         settings.microphone = self
             .microphone
             .selected()
@@ -612,8 +981,14 @@ impl Widgets {
     }
 }
 fn dropdown() -> gtk::DropDown {
+    let expr = gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        None::<gtk::Expression>,
+        "string",
+    );
     gtk::DropDown::builder()
         .enable_search(true)
+        .expression(&expr)
         .hexpand(true)
         .build()
 }
@@ -663,6 +1038,7 @@ fn tag_child_popovers(parent: &impl IsA<gtk::Widget>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shortcut::ShortcutSpec;
     #[test]
     #[ignore = "requires an isolated GTK display (Broadway), not the user's compositor"]
     fn native_widgets_preserve_drafts_signals_and_close_without_saving() {
@@ -731,6 +1107,8 @@ mod tests {
             "input-keyboard-symbolic",
             "video-display-symbolic",
             "preferences-system-symbolic",
+            "view-refresh-symbolic",
+            "edit-clear-symbolic",
         ] {
             assert!(theme.has_icon(icon), "missing icon: {icon}");
         }
@@ -813,20 +1191,76 @@ mod tests {
     }
 
     #[test]
-    fn saved_model_is_preserved_and_server_save_does_not_commit_other_drafts() {
+    fn dual_shortcut_validation_and_gtk_key_capture_helpers() {
+        use crate::shortcut::ShortcutSpec;
+
+        let t_spec = ShortcutSpec::parse("SUPER + ALT + V").unwrap();
+        let w_same = ShortcutSpec::parse("ALT + SUPER + V").unwrap();
+        let w_diff = ShortcutSpec::parse("SUPER + ALT + W").unwrap();
+
+        // 1. Dual shortcut conflict validation
+        assert!(validate_shortcuts(Some(&t_spec), Some(&w_diff)).is_ok());
+        assert!(validate_shortcuts(Some(&t_spec), None).is_ok());
+        assert!(validate_shortcuts(None, Some(&w_diff)).is_ok());
+        assert!(validate_shortcuts(None, None).is_ok());
+        let conflict_err = validate_shortcuts(Some(&t_spec), Some(&w_same)).unwrap_err();
+        assert!(conflict_err.contains("conflicto"));
+
+        // 2. GTK key event parsing for shortcut capture button
+        let state = gtk::gdk::ModifierType::SUPER_MASK | gtk::gdk::ModifierType::ALT_MASK;
+        let parsed = parse_gtk_key(state, gtk::gdk::Key::W).unwrap();
+        assert_eq!(parsed.key, "W");
+        assert_eq!(parsed.modifiers, vec!["ALT", "SUPER"]);
+        assert_eq!(parsed.to_binding_string(), "ALT + SUPER + W");
+
+        // Escape cancels
+        assert_eq!(parse_gtk_key(state, gtk::gdk::Key::Escape), Err("cancel"));
+        // BackSpace and Delete clear
+        assert_eq!(parse_gtk_key(state, gtk::gdk::Key::BackSpace), Err("clear"));
+        assert_eq!(parse_gtk_key(state, gtk::gdk::Key::Delete), Err("clear"));
+        // Pure modifier keys are ignored
+        assert_eq!(parse_gtk_key(state, gtk::gdk::Key::Super_L), Err("modifier_only"));
+        assert_eq!(parse_gtk_key(state, gtk::gdk::Key::Alt_L), Err("modifier_only"));
+    }
+
+    #[test]
+    fn writing_model_selection_and_catalog_preserves_both_selected_models() {
         let saved = Settings {
             model: "account/audio".into(),
+            writing_model: "gemini-2.5-flash".into(),
             ..Settings::default()
         };
-        let mut draft = Draft::new(&saved, &["account/audio".into()]);
-        assert_eq!(selected(&draft.available(), &draft.settings.model), 0);
-        draft.settings.prompt = "pending".into();
-        draft.server_saved("https://new.example");
-        assert_eq!(draft.settings.prompt, "pending");
+        let mut draft = Draft::new(&saved, &["plain".into(), "account/audio".into(), "gemini-2.5-flash".into()]);
         assert_eq!(draft.settings.model, "account/audio");
+        assert_eq!(draft.settings.writing_model, "gemini-2.5-flash");
+
+        // Writing model can be updated independently of account filter
+        draft.choose_writing_model("plain");
+        assert_eq!(draft.settings.writing_model, "plain");
+        assert_eq!(draft.settings.model, "account/audio");
+
+        // Server refresh clears models, then catalog loads new models
+        draft.server_saved("https://api.example");
         assert!(draft.models.is_empty());
-        assert_ne!(saved.prompt, draft.settings.prompt);
-        assert_eq!(saved.base_url, settings::DEFAULT_BASE_URL);
-        assert_eq!(Draft::new(&saved, &[]).settings.prompt, saved.prompt);
+        assert_eq!(draft.settings.model, "account/audio");
+        assert_eq!(draft.settings.writing_model, "plain");
+
+        draft.models = vec!["plain".into(), "account/audio".into(), "new-writing-model".into()];
+        draft.choose_writing_model("new-writing-model");
+        assert_eq!(draft.settings.writing_model, "new-writing-model");
+        assert_eq!(draft.settings.model, "account/audio");
+
+        // Writing prompt defaults and restoration
+        draft.settings.writing_prompt = "Custom prompt".into();
+        assert_ne!(draft.settings.writing_prompt, settings::DEFAULT_WRITING_PROMPT);
+        draft.settings.writing_prompt = settings::DEFAULT_WRITING_PROMPT.into();
+        assert_eq!(draft.settings.writing_prompt, settings::DEFAULT_WRITING_PROMPT);
+
+        // Writing shortcut assignment and clear
+        draft.settings.writing_shortcut = ShortcutSpec::parse("SUPER + ALT + W");
+        assert!(draft.settings.writing_shortcut.is_some());
+        draft.settings.writing_shortcut = None;
+        assert!(draft.settings.writing_shortcut.is_none());
     }
 }
+
