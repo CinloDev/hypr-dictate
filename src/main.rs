@@ -188,6 +188,8 @@ impl App {
         {
             let dock_hidden = *dock_was_hidden;
             ui.cancel_arm();
+            self.mode = hypr_dictate::DictationMode::Transcription;
+            ui.set_mode(hypr_dictate::DictationMode::Transcription);
             if dock_hidden {
                 ui.hide();
             }
@@ -206,15 +208,6 @@ impl App {
                 .is_some();
             if timeout || exited {
                 let _ = self.cancel(ui);
-                ui.capture_keyboard(false);
-                if let Some(address) = self.lifecycle.target_address.take() {
-                    let _ = restore(&address);
-                }
-                if self.lifecycle.dock_temporarily_shown {
-                    ui.hide();
-                    self.lifecycle.dock_temporarily_shown = false;
-                }
-                self.lifecycle.cancel();
                 ui.message = if timeout {
                     "Límite de 5 min alcanzado".into()
                 } else {
@@ -224,18 +217,43 @@ impl App {
                 self.phase = Phase::Idle;
             }
         }
+
+        if self.lifecycle.waiting_release.is_some()
+            && matches!(self.phase, Phase::Idle | Phase::Error)
+            && self.recording_started.is_none()
+        {
+            ui.capture_keyboard(false);
+            if let Some(address) = self.lifecycle.target_address.take() {
+                let _ = restore(&address);
+            }
+            if self.lifecycle.dock_temporarily_shown {
+                ui.hide();
+                self.lifecycle.dock_temporarily_shown = false;
+            }
+            self.lifecycle.cancel();
+        }
     }
     fn cancel(&mut self, ui: &mut ui::Ui) -> Result<()> {
         ui.cancel_arm();
         self.recording_started = None;
         self.discard_capture();
-        self.lifecycle.cancel();
         self.phase = Phase::Idle;
         self.mode = hypr_dictate::DictationMode::Transcription;
         ui.set_mode(hypr_dictate::DictationMode::Transcription);
         ui.level = 0.;
         ui.message = "Dictado cancelado".into();
         ui.dirty = true;
+        if self.lifecycle.waiting_release.is_none() {
+            ui.capture_keyboard(false);
+            if let Some(address) = self.lifecycle.target_address.take() {
+                let _ = restore(&address);
+            }
+            if self.lifecycle.dock_temporarily_shown {
+                ui.hide();
+                self.lifecycle.dock_temporarily_shown = false;
+            }
+            self.lifecycle.cancel();
+        }
         Ok(())
     }
     fn stop(&mut self) -> Result<()> {
@@ -392,16 +410,24 @@ impl App {
                     Ok(())
                 }
             }
-            Event::KeyPress(key) => match self.lifecycle.on_key_press(key) {
-                hypr_dictate::KeyAction::StopRecording => self.stop(),
-                hypr_dictate::KeyAction::CancelRecording => self.cancel(ui),
-                _ => Ok(()),
-            },
+            Event::KeyPress(key) => {
+                if key == hypr_dictate::CaptureKey::Escape && matches!(self.phase, Phase::Processing(_)) {
+                    self.lifecycle.generation = self.lifecycle.generation.wrapping_add(1);
+                    self.lifecycle.waiting_release = Some(key);
+                    self.cancel(ui)
+                } else {
+                    match self.lifecycle.on_key_press(key) {
+                        hypr_dictate::KeyAction::StopRecording => self.stop(),
+                        hypr_dictate::KeyAction::CancelRecording => self.cancel(ui),
+                        _ => Ok(()),
+                    }
+                }
+            }
             Event::KeyRelease(key) => (|| -> Result<()> {
                 match self.lifecycle.on_key_release(key) {
                     hypr_dictate::KeyAction::ReleaseAndInsert => {
-                        ui.capture_keyboard(false);
                         if let Some((address, text)) = self.lifecycle.take_deferred() {
+                            ui.capture_keyboard(false);
                             let restore_res = restore(&address);
                             let type_res = if restore_res.is_ok() && !text.is_empty() {
                                 ui.insert_text(&text, &address, self.mode)
@@ -417,9 +443,6 @@ impl App {
                             }
                             restore_res?;
                             type_res?;
-                        } else if let Some(address) = &self.lifecycle.target_address {
-                            // Si la tecla se soltó antes de la respuesta API, restaurar foco inmediatamente
-                            let _ = restore(address);
                         }
                     }
                     hypr_dictate::KeyAction::ReleaseAndCancel => {
@@ -466,11 +489,6 @@ impl App {
                     "start" => {
                         if matches!(self.phase, Phase::Processing(_)) {
                             self.cancel(ui)?;
-                            ui.capture_keyboard(false);
-                            if self.lifecycle.dock_temporarily_shown {
-                                ui.hide();
-                            }
-                            self.lifecycle.cancel();
                             Ok(())
                         } else if matches!(self.phase, Phase::Recording(_)) {
                             ui.capture_keyboard(false);
@@ -484,11 +502,6 @@ impl App {
                     "start-formal" => {
                         if matches!(self.phase, Phase::Processing(_)) {
                             self.cancel(ui)?;
-                            ui.capture_keyboard(false);
-                            if self.lifecycle.dock_temporarily_shown {
-                                ui.hide();
-                            }
-                            self.lifecycle.cancel();
                             Ok(())
                         } else if matches!(self.phase, Phase::Recording(_)) {
                             ui.capture_keyboard(false);
@@ -512,11 +525,6 @@ impl App {
                     "toggle" => {
                         if matches!(self.phase, Phase::Processing(_)) {
                             self.cancel(ui)?;
-                            ui.capture_keyboard(false);
-                            if self.lifecycle.dock_temporarily_shown {
-                                ui.hide();
-                            }
-                            self.lifecycle.cancel();
                             Ok(())
                         } else if matches!(self.phase, Phase::Recording(_)) {
                             ui.capture_keyboard(false);
@@ -531,8 +539,6 @@ impl App {
                         ui.cancel_arm();
                         if ui.is_visible() && matches!(self.phase, Phase::Recording(_) | Phase::Processing(_)) {
                             let _ = self.cancel(ui);
-                            ui.capture_keyboard(false);
-                            self.lifecycle.cancel();
                         }
                         ui.toggle_visibility();
                         Ok(())
@@ -898,15 +904,44 @@ pub fn is_valid_command(cmd: &str) -> bool {
     .contains(&cmd)
 }
 
+fn resolve_api_key() -> Result<String> {
+    if let Ok(val) = std::env::var("CLIPROXYAPI_API_KEY")
+        && !val.trim().is_empty()
+    {
+        return Ok(val);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let env_path = PathBuf::from(home).join(".env");
+        if let Ok(contents) = std::fs::read_to_string(env_path) {
+            for line in contents.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let stripped = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+                if let Some((k, v)) = stripped.split_once('=')
+                    && k.trim() == "CLIPROXYAPI_API_KEY"
+                {
+                    let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                    if !val.is_empty() {
+                        return Ok(val);
+                    }
+                }
+            }
+        }
+    }
+    bail!("Falta CLIPROXYAPI_API_KEY")
+}
+
 fn launch_background(path: &std::path::Path, hidden: bool) -> Result<()> {
     let exe = std::env::current_exe().context("No se pudo determinar el ejecutable actual")?;
-    let key = std::env::var("CLIPROXYAPI_API_KEY").context("Falta CLIPROXYAPI_API_KEY")?;
-    ensure!(!key.is_empty(), "CLIPROXYAPI_API_KEY está vacía");
+    let key = resolve_api_key()?;
 
     let stderr_file = tempfile::tempfile()?;
     let mut stderr_read = stderr_file.try_clone()?;
 
     let mut cmd = Command::new(exe);
+    cmd.env("CLIPROXYAPI_API_KEY", &key);
     cmd.arg("run");
     if hidden {
         cmd.arg("--hidden");
@@ -988,10 +1023,9 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    bail!(
-                        "Socket ocupado o residual en {:?}: si no hay otro proceso ejecutándose, elimina manualmente el socket residual",
-                        path
-                    );
+                    let _ = std::fs::remove_file(&path);
+                    launch_background(&path, false)?;
+                    return Ok(());
                 }
                 Err(err) => {
                     return Err(err).context("No se pudo conectar al socket de hypr-dictate");
@@ -1005,7 +1039,10 @@ fn main() -> Result<()> {
                 let _ = stream.shutdown(std::net::Shutdown::Write);
                 return Ok(());
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound && (command == "start" || command == "start-formal") => {
+            Err(err) if (err.kind() == std::io::ErrorKind::NotFound || err.kind() == std::io::ErrorKind::ConnectionRefused) && (command == "start" || command == "start-formal") => {
+                if err.kind() == std::io::ErrorKind::ConnectionRefused {
+                    let _ = std::fs::remove_file(&path);
+                }
                 launch_background(&path, true)?;
                 let mut stream = UnixStream::connect(&path)
                     .context("No se pudo conectar al socket tras iniciar en segundo plano")?;
@@ -1024,14 +1061,32 @@ fn main() -> Result<()> {
             }
         }
     }
-    let key = std::env::var("CLIPROXYAPI_API_KEY").context("Falta CLIPROXYAPI_API_KEY")?;
-    ensure!(!key.is_empty(), "CLIPROXYAPI_API_KEY está vacía");
+    let key = resolve_api_key()?;
     let settings = settings::Settings::load()?;
     let (endpoint, _) = api_endpoints(Some(&settings.base_url))?;
-    // Never unlink an existing path: it may belong to another live process.
-    let listener = UnixListener::bind(&path).context(
-        "Socket ocupado: si no hay otro proceso, elimina manualmente el socket residual",
-    )?;
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            match UnixStream::connect(&path) {
+                Err(conn_err) if conn_err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    let _ = std::fs::remove_file(&path);
+                    UnixListener::bind(&path).context(
+                        "Socket ocupado: si no hay otro proceso, elimina manualmente el socket residual",
+                    )?
+                }
+                _ => {
+                    return Err(err).context(
+                        "Socket ocupado: si no hay otro proceso, elimina manualmente el socket residual",
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            return Err(err).context(
+                "Socket ocupado: si no hay otro proceso, elimina manualmente el socket residual",
+            );
+        }
+    };
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {
@@ -1531,5 +1586,183 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
+    }
+
+    #[test]
+    fn escape_press_and_release_lifecycle_restores_keyboard_and_target_address() {
+        let (socket, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = wayland_client::Connection::from_socket(socket).unwrap();
+        let queue = connection.new_event_queue::<ui::Ui>();
+        let qh = queue.handle();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ui = ui::Ui::new_for_test(connection, qh, tx);
+
+        let mut app = app(Phase::Idle);
+        let target = "0x556677889900".to_string();
+
+        // Simulate recording in Writing (blue) mode
+        ui.capture_keyboard(true);
+        assert!(ui.capturing_keyboard);
+        app.mode = hypr_dictate::DictationMode::Writing;
+        app.phase = Phase::Recording(target.clone());
+        app.lifecycle.start(target.clone(), true);
+        assert_eq!(app.lifecycle.target_address, Some(target.clone()));
+        assert!(app.lifecycle.is_recording);
+
+        // User presses Escape
+        app.event(Event::KeyPress(hypr_dictate::CaptureKey::Escape), &mut ui);
+
+        // Still capturing keyboard while Escape key is held physically
+        assert_eq!(app.phase, Phase::Idle);
+        assert!(ui.capturing_keyboard, "Debe mantener captura de teclado mientras Escape esté presionado");
+        assert_eq!(app.lifecycle.waiting_release, Some(hypr_dictate::CaptureKey::Escape));
+        assert_eq!(app.lifecycle.target_address, Some(target.clone()), "target_address debe conservarse hasta la liberación");
+
+        // User releases Escape
+        app.event(Event::KeyRelease(hypr_dictate::CaptureKey::Escape), &mut ui);
+
+        // Upon release, keyboard capture is released and target address is restored/cleared
+        assert!(!ui.capturing_keyboard, "ui.capturing_keyboard debe liberarse al soltar Escape");
+        assert_eq!(app.lifecycle.waiting_release, None);
+        assert_eq!(app.lifecycle.target_address, None);
+        assert_eq!(app.mode, hypr_dictate::DictationMode::Transcription);
+        assert_eq!(app.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn escape_press_during_processing_cancels_and_release_restores_keyboard() {
+        let (socket, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = wayland_client::Connection::from_socket(socket).unwrap();
+        let queue = connection.new_event_queue::<ui::Ui>();
+        let qh = queue.handle();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ui = ui::Ui::new_for_test(connection, qh, tx);
+
+        let mut app = app(Phase::Idle);
+        let target = "0x556677889900".to_string();
+
+        ui.capture_keyboard(true);
+        app.mode = hypr_dictate::DictationMode::Writing;
+        app.phase = Phase::Processing(target.clone());
+        app.lifecycle.start(target.clone(), false);
+        app.lifecycle.is_recording = false;
+
+        // Escape pressed during processing
+        app.event(Event::KeyPress(hypr_dictate::CaptureKey::Escape), &mut ui);
+        assert_eq!(app.phase, Phase::Idle);
+        assert_eq!(app.lifecycle.waiting_release, Some(hypr_dictate::CaptureKey::Escape));
+
+        // Escape released
+        app.event(Event::KeyRelease(hypr_dictate::CaptureKey::Escape), &mut ui);
+        assert!(!ui.capturing_keyboard);
+        assert_eq!(app.lifecycle.waiting_release, None);
+        assert_eq!(app.lifecycle.target_address, None);
+    }
+
+    #[test]
+    fn cancel_without_waiting_release_immediately_releases_keyboard() {
+        let (socket, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = wayland_client::Connection::from_socket(socket).unwrap();
+        let queue = connection.new_event_queue::<ui::Ui>();
+        let qh = queue.handle();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ui = ui::Ui::new_for_test(connection, qh, tx);
+
+        let mut app = app(Phase::Idle);
+        let target = "0x556677889900".to_string();
+
+        ui.capture_keyboard(true);
+        app.phase = Phase::Recording(target.clone());
+        app.lifecycle.start(target.clone(), true);
+
+        // Cancel called when waiting_release is None (e.g. IPC reset)
+        app.event(Event::Command("reset".into()), &mut ui);
+        assert!(!ui.capturing_keyboard, "reset debe liberar el teclado inmediatamente");
+        assert_eq!(app.lifecycle.waiting_release, None);
+        assert_eq!(app.lifecycle.target_address, None);
+    }
+
+    #[test]
+    fn enter_release_during_processing_retains_keyboard_capture_until_finished_or_cancelled() {
+        let (socket, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = wayland_client::Connection::from_socket(socket).unwrap();
+        let queue = connection.new_event_queue::<ui::Ui>();
+        let qh = queue.handle();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ui = ui::Ui::new_for_test(connection, qh, tx);
+
+        let mut app = app(Phase::Idle);
+        let target = "0x556677889900".to_string();
+
+        ui.capture_keyboard(true);
+        app.mode = hypr_dictate::DictationMode::Writing;
+        app.phase = Phase::Recording(target.clone());
+        app.lifecycle.start(target.clone(), false);
+
+        // Press Enter to stop recording
+        app.phase = Phase::Processing(target.clone());
+        let action = app.lifecycle.on_key_press(hypr_dictate::CaptureKey::Return);
+        assert_eq!(action, hypr_dictate::KeyAction::StopRecording);
+
+        // Release Enter while API is still processing
+        app.event(Event::KeyRelease(hypr_dictate::CaptureKey::Return), &mut ui);
+        // Keyboard capture MUST still be active so Escape can cancel!
+        assert!(
+            ui.capturing_keyboard,
+            "Dock must retain keyboard capture while in Phase::Processing"
+        );
+        assert_eq!(app.phase, Phase::Processing(target.clone()));
+
+        // Escape pressed during processing
+        app.event(Event::KeyPress(hypr_dictate::CaptureKey::Escape), &mut ui);
+        assert_eq!(app.phase, Phase::Idle);
+        assert_eq!(
+            app.lifecycle.waiting_release,
+            Some(hypr_dictate::CaptureKey::Escape)
+        );
+
+        // Escape released
+        app.event(Event::KeyRelease(hypr_dictate::CaptureKey::Escape), &mut ui);
+        assert!(!ui.capturing_keyboard);
+        assert_eq!(app.lifecycle.waiting_release, None);
+        assert_eq!(app.lifecycle.target_address, None);
+    }
+
+    #[test]
+    fn enter_release_during_processing_retains_keyboard_capture_until_api_finished() {
+        let (socket, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = wayland_client::Connection::from_socket(socket).unwrap();
+        let queue = connection.new_event_queue::<ui::Ui>();
+        let qh = queue.handle();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut ui = ui::Ui::new_for_test(connection, qh, tx);
+
+        let mut app = app(Phase::Idle);
+        let target = "0x556677889900".to_string();
+
+        ui.capture_keyboard(true);
+        app.mode = hypr_dictate::DictationMode::Writing;
+        app.phase = Phase::Recording(target.clone());
+        let generation = app.lifecycle.start(target.clone(), true);
+
+        // Press Enter to stop recording
+        app.phase = Phase::Processing(target.clone());
+        let action = app.lifecycle.on_key_press(hypr_dictate::CaptureKey::Return);
+        assert_eq!(action, hypr_dictate::KeyAction::StopRecording);
+
+        // Release Enter while API is still processing
+        app.event(Event::KeyRelease(hypr_dictate::CaptureKey::Return), &mut ui);
+        assert!(ui.capturing_keyboard);
+        assert_eq!(app.phase, Phase::Processing(target.clone()));
+
+        // API finishes with valid response (in unit test without actual window, restore fails cleanly)
+        app.event(
+            Event::Finished(generation, Ok((target.clone(), "Texto formal".into()))),
+            &mut ui,
+        );
+        // Keyboard capture is released regardless of success or target-missing error
+        assert!(!ui.capturing_keyboard);
+        assert_eq!(app.phase, Phase::Error);
+        assert!(app.error.contains("La ventana original ya no existe"));
     }
 }

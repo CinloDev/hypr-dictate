@@ -1,5 +1,5 @@
 use crate::{App, Event, preferences::Preferences};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::{
     io::{Seek, SeekFrom, Write},
     os::fd::AsFd,
@@ -267,20 +267,30 @@ impl Ui {
         Ok(())
     }
     pub fn close_preferences(&mut self) {
-        if let Some(preferences) = self.preferences.take()
-            && preferences.visible()
-        {
+        if let Some(preferences) = self.preferences.take() {
             preferences.close();
+            let context = gtk4::glib::MainContext::default();
+            for _ in 0..16 {
+                if !context.pending() {
+                    break;
+                }
+                context.iteration(false);
+            }
         }
     }
     pub fn toggle_preferences(&mut self) {
         if self.capturing_keyboard {
             return;
         }
-        if let Some(preferences) = self.preferences.take()
-            && preferences.visible()
-        {
+        if let Some(preferences) = self.preferences.take() {
             preferences.close();
+            let context = gtk4::glib::MainContext::default();
+            for _ in 0..16 {
+                if !context.pending() {
+                    break;
+                }
+                context.iteration(false);
+            }
             return;
         }
         match Preferences::new(
@@ -715,6 +725,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Ui {
                     for chunk in keys.as_chunks::<4>().0 {
                         state.pressed_keys.insert(u32::from_ne_bytes(*chunk));
                     }
+                    if state.mods_depressed == 0 && state.pressed_keys.is_empty() {
+                        state.seen_modifiers = true;
+                    }
                     state.check_arm_ready();
                 }
             }
@@ -737,8 +750,8 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Ui {
                 if let Some(xkb_state) = &mut state.xkb_state {
                     xkb_state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
                 }
+                state.seen_modifiers = true;
                 if state.seen_enter {
-                    state.seen_modifiers = true;
                     state.check_arm_ready();
                 }
             }
@@ -761,6 +774,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for Ui {
                     let sym = state.xkb_state.as_ref().map(|s| s.key_get_one_sym(xkb_key));
                     if sym == Some(xkb::Keysym::Escape) && keystate == wl_keyboard::KeyState::Pressed {
                         state.cancel_arm();
+                        let _ = state.tx.send(Event::Command("reset".into()));
                         return;
                     }
                     state.check_arm_ready();
@@ -983,23 +997,54 @@ pub const PASTE_KEYMAP: &str = "xkb_keymap {\n\
     };\n\
 };\n";
 
-pub fn copy_to_clipboard(text: &str) -> Result<()> {
-    let mut child = Command::new("wl-copy")
+pub fn write_clipboard(text: &str, command: &mut Command) -> Result<()> {
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
-        .context("No se pudo ejecutar wl-copy")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(text.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
+        .context("No se pudo iniciar wl-copy para pegar el texto")?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("No se pudo abrir la entrada de wl-copy")?;
+    let bytes = text.as_bytes().to_vec();
+    let write_handle = std::thread::spawn(move || stdin.write_all(&bytes));
+
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait());
+    });
+
+    let status = match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(res) => res.context("No se pudo esperar a wl-copy")?,
+        Err(_) => {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            bail!("Tiempo de espera agotado al copiar al portapapeles con wl-copy");
+        }
+    };
+
+    let write_res = write_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("Falló el hilo escritor de wl-copy"))?;
+    write_res.context("No se pudo copiar el texto al portapapeles")?;
+
     ensure!(
-        output.status.success(),
-        "wl-copy falló: {}",
-        String::from_utf8_lossy(&output.stderr)
+        status.success(),
+        "No se pudo copiar el texto al portapapeles; no se pegó texto"
     );
     Ok(())
+}
+
+pub fn copy_to_clipboard(text: &str) -> Result<()> {
+    write_clipboard(
+        text,
+        Command::new("wl-copy").args(["--type", "text/plain;charset=utf-8"]),
+    )
 }
 
 pub fn run(mut app: App, rx: mpsc::Receiver<Event>, initially_hidden: bool) -> Result<()> {
@@ -1049,7 +1094,9 @@ pub fn run(mut app: App, rx: mpsc::Receiver<Event>, initially_hidden: bool) -> R
             context.iteration(false);
         }
         if ui.preferences.as_ref().is_some_and(|p| !p.visible()) {
-            ui.preferences = None;
+            if let Some(p) = ui.preferences.take() {
+                p.close();
+            }
         }
         while let Ok(event) = rx.try_recv() {
             app.event(event, &mut ui);
@@ -1335,5 +1382,37 @@ mod tests {
         // Writing mode -> always clipboard paste (true)
         assert!(insertion_uses_clipboard(DictationMode::Writing, false));
         assert!(insertion_uses_clipboard(DictationMode::Writing, true));
+    }
+
+    #[test]
+    fn clipboard_writer_sends_utf8_over_stdin_and_propagates_failure() {
+        let text = "Solicitud: equipos, ñ, tildes y 🙂\n\n\tDos equipos";
+        let mut reader = std::process::Command::new("python3");
+        reader.args([
+            "-c",
+            "import sys; assert sys.stdin.buffer.read().decode('utf-8') == 'Solicitud: equipos, ñ, tildes y 🙂\\n\\n\\tDos equipos'",
+        ]);
+        write_clipboard(text, &mut reader).unwrap();
+        assert!(write_clipboard(text, &mut std::process::Command::new("false")).is_err());
+        assert!(
+            write_clipboard(
+                text,
+                &mut std::process::Command::new("/nonexistent/hypr-dictate-wl-copy")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn clipboard_writer_times_out_on_hung_process() {
+        let mut reader = std::process::Command::new("sleep");
+        reader.arg("10");
+        let start = std::time::Instant::now();
+        let res = write_clipboard("test", &mut reader);
+        assert!(res.is_err());
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "must time out and kill hung process without hanging UI thread"
+        );
     }
 }
