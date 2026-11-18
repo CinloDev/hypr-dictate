@@ -20,6 +20,12 @@ Los ajustes usan controles GTK4 nativos: desplegables con búsqueda, campo de UR
 
 En **General**, «Automática» muestra modelos sin prefijo. Son rutas del catálogo, no credenciales verificadas; no todos los modelos aceptan audio. Pulsa **Guardar cambios** para aplicar modelo, atajo, micrófono, pantalla y parámetros de IA. La pantalla del dock cambia al guardar, no como vista previa. Cerrar por el botón o mediante Escape descarta los cambios sin guardar y destruye la capa. Las preferencias sin secretos se guardan en `~/.config/hypr-dictate/settings.json`.
 
+En **Redacción Pro**, se configuran los parámetros dedicados para el modo de redacción inteligente:
+- **Modelo de Redacción:** selector desplegable con búsqueda en tiempo real (`enable_search`) para localizar rápidamente modelos entre catálogos extensos. Incluye botón **Actualizar** para recargar la lista de modelos desde el servidor sin perder la selección activa.
+- **Atajo de Redacción (`start-formal`):** botón interactivo de captura mediante `EventControllerKey`. Al hacer clic, pulsa cualquier combinación de teclas (por ejemplo, `SUPER + ALT + W`) para asignarla, presiona `Escape` para cancelar o `Delete`/`Backspace` (o el botón «Sin atajo») para desvincularlo.
+- **Prompt de Redacción:** editor multilínea con historial de deshacer (`Ctrl+Z`), ajuste de línea y scroll vertical, acompañado del botón **Restaurar prompt de redacción** para volver al prompt profesional por defecto.
+- **Validación de atajos:** al pulsar **Guardar cambios**, el sistema valida que el atajo de transcripción y el de redacción no entren en conflicto. Si ambos están configurados, aplica de forma atómica el bloque dual gestionado (`-- BEGIN hypr-dictate` ... `-- END hypr-dictate` con sintaxis Lua `hl.bind`) en `~/.config/hypr/bindings.lua` y valida sintaxis con `luac -p`.
+
 ### Panel lateral y monitor en Hyprland
 
 El panel de preferencias se gestiona a través del protocolo `wlr-layer-shell`, por lo que **no requiere reglas de ventana de Hyprland** para flotar o posicionarse:
@@ -47,22 +53,38 @@ Modelo predeterminado: `cic/gemini-3.5-flash-lite`. Para cambiarlo, abre los aju
 Con el proceso principal ejecutándose:
 
 ```bash
+# Modo Transcripción rápida (escribe directamente sin saltos de línea accidentales)
 ./target/release/hypr-dictate start
+
+# Modo Redacción Pro (dictado formal, párrafos y pegado por portapapeles)
+./target/release/hypr-dictate start-formal
+
+# Detener o cancelar
 ./target/release/hypr-dictate stop
-# Alternativa: toggle (exclusivo para iniciar/detener dictado)
+# Alternativa: toggle (exclusivo para iniciar/detener transcripción)
 ```
 
-El atajo predeterminado es `SUPER + ALT + V` (con inicio por pulsación simple, sin necesidad de mantener presionada la tecla).
+### Modos duales de dictado
 
-- **Iniciar dictado:** Presiona `SUPER + ALT + V` desde cualquier ventana o campo enfocado en cualquier monitor. Si el dock estaba oculto, se mostrará temporalmente mientras dure el dictado.
-- **Detener e insertar:** Presiona `Enter` (o `Enter` del teclado numérico) para detener la grabación, transcribir e insertar el texto en la ventana receptora. El sistema captura el teclado exclusivamente durante la grabación y espera la liberación física de la tecla `Enter` antes de liberar la captura y proceder a la inserción, garantizando que la tecla `Enter` no se filtre ni ejecute/envíe el formulario o prompt.
-- **Cancelar:** Presiona `Escape` para cancelar y descartar el audio inmediatamente sin realizar peticiones a la API, restaurando el foco en la ventana original. Al terminar o cancelar, si el dock estaba previamente oculto, se restaura a su estado oculto automáticamente.
+Hypr Dictate cuenta con dos modos especializados para distintos flujos de trabajo:
 
-El panel permite elegir entre combinaciones predefinidas (`SUPER + ALT + V`, `CTRL + SHIFT + D`, `CTRL + ALT + D`, `SUPER + SHIFT + D`, `SUPER + F9`, `SUPER + F10`) o desactivar el atajo.
+1. **Modo Transcripción (Coral / Rojo — `#EF94C7` / `#FFB1DD`):**
+   - Disparado con `hypr-dictate start` o el atajo predeterminado `SUPER + ALT + V`.
+   - Escribe carácter a carácter directamente en la ventana activa mediante teclado virtual Wayland.
+   - **Sanitización estricta de una sola línea:** convierte todos los retornos de carro en espacios para evitar envíos prematuros en terminales, mensajería instantánea o prompts.
+   - Modelo por defecto: `cic/gemini-3.5-flash-lite`.
 
-Al guardar un cambio de atajo, comprueba conflictos en los bindings activos y modifica únicamente el bloque `-- BEGIN hypr-dictate` / `-- END hypr-dictate` de `~/.config/hypr/bindings.lua`. Valida sintaxis con `luac -p`, recarga Hyprland y restaura el archivo si detecta errores de configuración. Requiere que ese archivo siga siendo el módulo cargado por tu configuración Lua.
+2. **Modo Redacción Pro (Azul — `#61AFEF` / `#528BFF`):**
+   - Disparado con `hypr-dictate start-formal` o su atajo configurado (ej. `SUPER + ALT + W`).
+   - Pensado para redacción de correos, cartas, documentación y textos largos o estructurados.
+   - **Inserción multilínea por portapapeles:** preserva párrafos y saltos de línea formateados, copiando el resultado al portapapeles e inyectando un pegado atómico (`Ctrl+V` o `Ctrl+Shift+V` si la ventana enfocada es un emulador de terminal).
+   - Modelo por defecto: `gemini-2.5-flash`.
 
-No instala arranque automático; el proceso principal debe seguir activo y heredar la clave. Una recarga externa puede afectar los bindings como cualquier otra configuración de Hyprland.
+En ambos modos:
+- **Iniciar dictado:** Pulsa una vez el atajo correspondiente (sin necesidad de mantenerlo presionado). Si el dock estaba oculto, se muestra temporalmente con el color distintivo del modo.
+- **Detener e insertar:** Presiona `Enter` (o `Enter` del teclado numérico). El sistema captura el teclado durante la grabación y espera la liberación física de la tecla antes de insertar, evitando que la pulsación de confirmación se transmita a la aplicación receptora.
+- **Cancelar:** Presiona `Escape` para cancelar y descartar el audio inmediatamente. Al terminar o cancelar, si el dock estaba oculto, vuelve a ocultarse automáticamente.
+- **Timeout extendido a 120s:** Las peticiones a la API cuentan con un timeout de 120 segundos para permitir el dictado y razonamiento de textos extensos en modelos de redacción.
 
 ## Mostrar u ocultar la interfaz (toggle-ui)
 
