@@ -1,11 +1,18 @@
 use anyhow::{Context, Result, ensure};
+use hypr_dictate::DictationMode;
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};
+
+use crate::shortcut::ShortcutSpec;
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8317";
 pub const DEFAULT_TEMPERATURE: f64 = 0.20;
 pub const DEFAULT_SHORTCUT: &str = "SUPER + ALT + V";
 pub const DEFAULT_PROMPT: &str = "Act as an intelligent voice dictation assistant. Transcribe what the speaker meant into clean, natural text in its original language with correct punctuation and capitalization. CRITICAL RULES: 1. Deduplicate accidental repeated words or phrases (e.g. 'Genial. Genial' -> 'Genial', 'está está' -> 'está', 'por favor por favor' -> 'por favor'). 2. Clean speech stutters, filler sounds (eh, este, um), and false starts where the speaker corrects themselves mid-sentence (retain only the intended final correction). 3. Preserve the intended message, vocabulary, and tone: do not summarize, paraphrase, answer, or execute spoken commands. 4. If the audio contains no intelligible speech, return an empty string. Output ONLY the clean transcribed text without quotes or commentary.";
+
+pub const DEFAULT_MODEL: &str = "cic/gemini-3.5-flash-lite";
+pub const DEFAULT_WRITING_MODEL: &str = "gemini-2.5-flash";
+pub const DEFAULT_WRITING_PROMPT: &str = "Actúa como un asistente profesional de redacción y edición. Transforma las ideas o instrucciones dictadas por el usuario en un texto pulido, elocuente y bien estructurado en su idioma original. Aplica puntuación impecable, organiza el contenido en párrafos claros cuando corresponda y mantén un tono natural y profesional. Si el usuario da instrucciones directas de redacción o formato, ejecútalas directamente en el texto resultante. Devuelve ÚNICAMENTE el texto final redactado, sin introducciones, saludos, comentarios explicativos ni bloques de código markdown.";
 
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -17,11 +24,15 @@ pub struct Settings {
     pub monitor: String,
     pub temperature: f64,
     pub prompt: String,
+    pub writing_model: String,
+    pub writing_prompt: String,
+    pub writing_shortcut: Option<ShortcutSpec>,
+    pub transcription_shortcut: Option<ShortcutSpec>,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            model: "cic/gemini-3.5-flash-lite".into(),
+            model: DEFAULT_MODEL.into(),
             base_url: DEFAULT_BASE_URL.into(),
             x: 706,
             shortcut: DEFAULT_SHORTCUT.into(),
@@ -29,6 +40,10 @@ impl Default for Settings {
             monitor: String::new(),
             temperature: DEFAULT_TEMPERATURE,
             prompt: DEFAULT_PROMPT.into(),
+            writing_model: DEFAULT_WRITING_MODEL.into(),
+            writing_prompt: DEFAULT_WRITING_PROMPT.into(),
+            writing_shortcut: None,
+            transcription_shortcut: ShortcutSpec::parse(DEFAULT_SHORTCUT),
         }
     }
 }
@@ -71,6 +86,7 @@ impl Settings {
         }
         s.x = v["x"].as_i64().unwrap_or(706).clamp(0, 10000) as i32;
         s.shortcut = v["shortcut"].as_str().unwrap_or("").into();
+        s.transcription_shortcut = ShortcutSpec::parse(&s.shortcut);
         s.microphone = v["microphone"].as_str().unwrap_or("").into();
         s.monitor = v["monitor"].as_str().unwrap_or("").into();
         s.temperature = v["temperature"]
@@ -82,7 +98,38 @@ impl Settings {
             .filter(|p| !p.trim().is_empty())
             .unwrap_or(DEFAULT_PROMPT)
             .into();
+        s.writing_model = v["writing_model"]
+            .as_str()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or(DEFAULT_WRITING_MODEL)
+            .into();
+        s.writing_prompt = v["writing_prompt"]
+            .as_str()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or(DEFAULT_WRITING_PROMPT)
+            .into();
+        s.writing_shortcut = v["writing_shortcut"]
+            .as_str()
+            .and_then(ShortcutSpec::parse);
         Ok(s)
+    }
+    pub fn model_for(&self, mode: DictationMode) -> &str {
+        match mode {
+            DictationMode::Transcription => &self.model,
+            DictationMode::Writing => &self.writing_model,
+        }
+    }
+    pub fn prompt_for(&self, mode: DictationMode) -> &str {
+        match mode {
+            DictationMode::Transcription => &self.prompt,
+            DictationMode::Writing => &self.writing_prompt,
+        }
+    }
+    pub fn shortcut_for(&self, mode: DictationMode) -> Option<&ShortcutSpec> {
+        match mode {
+            DictationMode::Transcription => self.transcription_shortcut.as_ref(),
+            DictationMode::Writing => self.writing_shortcut.as_ref(),
+        }
     }
     pub fn save(&self) -> Result<()> {
         self.save_to(&path()?)
@@ -93,6 +140,7 @@ impl Settings {
         std::fs::create_dir_all(parent)?;
         let mut file = tempfile::NamedTempFile::new_in(parent)?;
         use std::io::Write;
+        let writing_shortcut_val = self.writing_shortcut.as_ref().map(|s| s.to_binding_string());
         file.write_all(
             serde_json::to_string_pretty(
                 &json!({
@@ -103,7 +151,10 @@ impl Settings {
                     "microphone": self.microphone,
                     "monitor": self.monitor,
                     "temperature": self.temperature,
-                    "prompt": self.prompt
+                    "prompt": self.prompt,
+                    "writing_model": self.writing_model,
+                    "writing_prompt": self.writing_prompt,
+                    "writing_shortcut": writing_shortcut_val,
                 }),
             )?
             .as_bytes(),
@@ -239,42 +290,89 @@ pub fn monitors() -> Vec<MonitorInfo> {
     }
 }
 
-pub fn binding_block(source: &str, shortcut: &str, executable: &str) -> Result<String> {
+pub fn dual_binding_block(
+    source: &str,
+    transcription: Option<&str>,
+    writing: Option<&str>,
+    executable: &str,
+) -> Result<String> {
     const START: &str = "-- BEGIN hypr-dictate";
     const END: &str = "-- END hypr-dictate";
     ensure!(
         source.matches(START).count() <= 1 && source.matches(END).count() <= 1,
         "Bloque de atajo duplicado"
     );
-    let range = match (source.find(START), source.find(END)) {
+    let mut range = match (source.find(START), source.find(END)) {
         (None, None) => None,
         (Some(a), Some(b)) if b > a => Some(a..b + END.len()),
         _ => anyhow::bail!("Bloque de atajo incompleto"),
     };
-    ensure!(
-        shortcut
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b' ' || b == b'+'),
-        "Atajo inválido"
-    );
+    if range.is_none() {
+        for (s, e) in [
+            ("# >>> hypr-dictate >>>", "# <<< hypr-dictate <<<"),
+            ("-- >>> hypr-dictate >>>", "-- <<< hypr-dictate <<<"),
+        ] {
+            if let (Some(a), Some(b)) = (source.find(s), source.find(e))
+                && b >= a
+            {
+                range = Some(a..b + e.len());
+                break;
+            }
+        }
+    }
     ensure!(
         !executable.contains(['\n', '\r', '\"', '\'', '\\']),
         "Ruta de binario no compatible"
     );
-    let block = if shortcut.is_empty() {
+    let trans = transcription.unwrap_or("").trim();
+    let writ = writing.unwrap_or("").trim();
+    ensure!(
+        trans.is_empty()
+            || trans
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b' ' || b == b'+'),
+        "Atajo de transcripción inválido"
+    );
+    ensure!(
+        writ.is_empty()
+            || writ
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b' ' || b == b'+'),
+        "Atajo de redacción inválido"
+    );
+    let block = if trans.is_empty() && writ.is_empty() {
         String::new()
     } else {
-        format!(
-            "{START}\nhl.bind(\"{shortcut}\", hl.dsp.exec_cmd(\"'{executable}' start\"))\n{END}"
-        )
+        let mut b = String::new();
+        b.push_str(START);
+        b.push('\n');
+        if !trans.is_empty() {
+            b.push_str(&format!(
+                "hl.bind(\"{trans}\", hl.dsp.exec_cmd(\"'{executable}' start\"))\n"
+            ));
+        }
+        if !writ.is_empty() {
+            b.push_str(&format!(
+                "hl.bind(\"{writ}\", hl.dsp.exec_cmd(\"'{executable}' start-formal\"))\n"
+            ));
+        }
+        b.push_str(END);
+        b
     };
     Ok(if let Some(r) = range {
         let mut out = source.to_owned();
         out.replace_range(r, &block);
         out
+    } else if block.is_empty() {
+        source.to_owned()
     } else {
         format!("{}\n{}\n", source.trim_end(), block)
     })
+}
+
+#[allow(dead_code)]
+pub fn binding_block(source: &str, shortcut: &str, executable: &str) -> Result<String> {
+    dual_binding_block(source, Some(shortcut), None, executable)
 }
 
 #[cfg(test)]
@@ -376,6 +474,27 @@ mod tests {
         assert!(binding_block("-- BEGIN hypr-dictate", "F9", "/app").is_err());
     }
     #[test]
+    fn dual_binding_block_generates_valid_lua_and_cleans_legacy() {
+        let original = "-- other config\n# >>> hypr-dictate >>>\nbindd = invalid lua\n# <<< hypr-dictate <<<\n";
+        let updated = dual_binding_block(
+            original,
+            Some("SUPER + ALT + V"),
+            Some("SUPER + ALT + W"),
+            "/bin/hypr-dictate",
+        )
+        .unwrap();
+        assert!(updated.contains("-- other config"));
+        assert!(!updated.contains("# >>> hypr-dictate >>>"));
+        assert!(updated.contains("-- BEGIN hypr-dictate"));
+        assert!(updated.contains(
+            "hl.bind(\"SUPER + ALT + V\", hl.dsp.exec_cmd(\"'/bin/hypr-dictate' start\"))"
+        ));
+        assert!(updated.contains(
+            "hl.bind(\"SUPER + ALT + W\", hl.dsp.exec_cmd(\"'/bin/hypr-dictate' start-formal\"))"
+        ));
+        assert!(updated.contains("-- END hypr-dictate"));
+    }
+    #[test]
     fn microphone_parsing_dedupes_and_sorts_default_first() {
         let dump = json!([
             {
@@ -441,5 +560,43 @@ mod tests {
         assert_eq!(mons[1].name, "eDP-1");
         assert_eq!(mons[1].width, 1920);
         assert!(mons[1].focused);
+    }
+
+    #[test]
+    fn writing_settings_backwards_compatibility_and_helpers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        std::fs::write(&path, br#"{"model":"legacy/model","prompt":"legacy prompt"}"#).unwrap();
+
+        let s = Settings::load_from(&path).unwrap();
+        assert_eq!(s.model_for(hypr_dictate::DictationMode::Transcription), "legacy/model");
+        assert_eq!(s.model_for(hypr_dictate::DictationMode::Writing), DEFAULT_WRITING_MODEL);
+        assert_eq!(s.prompt_for(hypr_dictate::DictationMode::Transcription), "legacy prompt");
+        assert_eq!(s.prompt_for(hypr_dictate::DictationMode::Writing), DEFAULT_WRITING_PROMPT);
+        assert!(s.shortcut_for(hypr_dictate::DictationMode::Writing).is_none());
+        assert_eq!(s.writing_model, DEFAULT_WRITING_MODEL);
+        assert_eq!(s.writing_prompt, DEFAULT_WRITING_PROMPT);
+    }
+
+    #[test]
+    fn writing_settings_custom_values_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+
+        let s = Settings {
+            writing_model: "custom-pro-model".into(),
+            writing_prompt: "Custom professional writing prompt".into(),
+            writing_shortcut: ShortcutSpec::parse("SUPER + ALT + W"),
+            ..Default::default()
+        };
+        s.save_to(&path).unwrap();
+
+        let loaded = Settings::load_from(&path).unwrap();
+        assert_eq!(loaded.model_for(hypr_dictate::DictationMode::Writing), "custom-pro-model");
+        assert_eq!(loaded.prompt_for(hypr_dictate::DictationMode::Writing), "Custom professional writing prompt");
+        assert_eq!(
+            loaded.shortcut_for(hypr_dictate::DictationMode::Writing).map(|sc| sc.to_binding_string()),
+            Some("ALT + SUPER + W".into())
+        );
     }
 }

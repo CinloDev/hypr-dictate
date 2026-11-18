@@ -11,8 +11,9 @@ Documentación técnica de la integración de transcripción local, ciclo de vid
 | Módulo | Alcance técnico |
 |---|---|
 | `Cargo.toml` / `Cargo.lock` | Añadidas dependencias `gtk4 = "0.10"` y `gtk4-layer-shell = { version = "0.7", features = ["v1_3"] }`, conservando `xkbcommon = "0.8"`. |
-| `src/preferences.rs` | Panel lateral GTK4 con `gtk4-layer-shell` (ancho 420 px, altura adaptativa, anclaje Left/Top/Bottom, namespace `hypr-dictate-preferences`, layer Top, keyboard `OnDemand`, zona exclusiva automática y scroll vertical en todas las pestañas). |
-| `src/settings.rs` | Persistencia de campo `base_url` (por defecto `http://127.0.0.1:8317`), preservación del modelo predeterminado `cic/gemini-3.5-flash-lite`, atajo default `SUPER + ALT + V` y parseo de settings existentes. |
+| `src/preferences.rs` | Panel lateral GTK4 con `gtk4-layer-shell` (ancho 420 px, altura adaptativa, anclaje Left/Top/Bottom, namespace `hypr-dictate-preferences`, layer Top, keyboard `OnDemand`, zona exclusiva automática y scroll vertical en todas las pestañas). Añadida pestaña «Redacción Pro» con selector de modelo con búsqueda nativa, botón «Actualizar» para refresco de catálogo, captura interactiva de atajos mediante `EventControllerKey`, editor multilínea de prompt y validación estricta de conflictos de bindings. |
+| `src/settings.rs` | Persistencia de campos `base_url`, `model`, `prompt`, `writing_model` (default `gemini-2.5-flash`), `writing_prompt` (default `DEFAULT_WRITING_PROMPT`), `writing_shortcut` y `transcription_shortcut`, preservando compatibilidad con JSON legacy. |
+| `src/shortcut.rs` | Gestión de atajos duales (`ShortcutSpec`), renderizado con sintaxis Lua `hl.bind(...)` sin liberación `bindr`, actualización atómica del bloque `-- BEGIN hypr-dictate` con validación previa `luac -p` y soporte en `apply` para preservar ambos modos. |
 | `src/main.rs` | Validación rigurosa de URLs HTTP/HTTPS (sin credenciales, query ni fragmentos), manejo de `SaveServer`, recarga asíncrona de catálogo por generación y conservación del timeout de 25 s del cliente. |
 | `src/ui.rs` | Integración del event loop GLib/GTK4 en el loop Wayland, cierre coherente de preferencias al armar dictado (`arm`), ocultar dock (`hide`) o iniciar dictado (`start`), y conservación del renderer `attach` por archivos temporales del backup previo. |
 | `src/paint.rs` | Retiro del modal Cairo superpuesto y preservación exacta del caparazón del dock Wayland idéntico al backup. |
@@ -67,12 +68,27 @@ Documentación técnica de la integración de transcripción local, ciclo de vid
 
 ---
 
+### 5. Integración de Modo Redacción Pro y Preferencias Avanzadas (`feature/writing-mode-pro`)
+- **Archivos:** `src/preferences.rs`, `src/settings.rs`, `src/shortcut.rs`, `src/main.rs`, `src/ui.rs`, `src/lib.rs`, `README.md`, `CHANGELOG.md`.
+- **Responsabilidades y diseño:**
+  - **Modos duales especializados:**
+    - *Modo Transcripción:* Disparado por `hypr-dictate start` o atajo principal (ej. `SUPER + ALT + V`), con indicador visual en color coral/rojo (`#EF94C7` / `#FFB1DD`), escritura directa carácter a carácter con teclado virtual Wayland y sanitización estricta a una sola línea (convirtiendo retornos de carro en espacios para evitar envíos prematuros).
+    - *Modo Redacción Pro:* Disparado por `hypr-dictate start-formal` o atajo secundario dedicado (ej. `SUPER + ALT + W`), con indicador visual en color azul (`#61AFEF` / `#528BFF`), orientado a correspondencia, cartas y textos extensos formateados. Inserción mediante portapapeles con pegado automático (`Ctrl+V` o `Ctrl+Shift+V` en emuladores de terminal) preservando párrafos y saltos de línea estructurados.
+  - **Sanitización de texto selectiva:** Conserva repeticiones intencionadas legítimas en español (como superlativos enfáticos «muy muy», «más y más») y secuencias numéricas consecutivas, mientras elimina tartamudeos y repeticiones accidentales inmediatas.
+  - **Ampliación de Timeout HTTP:** Timeout de cliente ampliado a 120 segundos para permitir el dictado prolongado y el tiempo de respuesta requerido por modelos generativos de redacción.
+  - **Selector de modelos con búsqueda interactiva:** GTK4 `DropDown` con `enable_search(true)` y `PropertyExpression` sobre `gtk::StringObject` en ambos modos (Transcripción y Redacción), permitiendo filtrar y seleccionar modelos en catálogos extensos.
+  - **Botón «Actualizar» para catálogo:** Integrado en ambos selectores de modelos para recargar `/v1/models` desde CLIProxyAPI conservando los modelos actualmente seleccionados en cada modo.
+  - **Captura interactiva de atajos GTK4:** Botón de asignación de atajos de redacción mediante `EventControllerKey` nativo con detección de modificadores (Super, Ctrl, Alt, Shift), cancelación con Escape, borrado con Delete/Backspace y botón dedicado «Sin atajo».
+  - **Validación y aplicación de atajos duales:** Verificación preventiva de conflictos entre atajos de transcripción y redacción (`ShortcutSpec::conflicts_with`), gestionando ambos bindings dentro de `~/.config/hypr/bindings.lua` bajo el bloque delimitado `-- BEGIN hypr-dictate` / `-- END hypr-dictate` con sintaxis Lua `hl.bind` y validación estricta con `luac -p`.
+
+---
+
 ## Límites operativos reales
 
 | Parámetro | Valor verificado en código | Ubicación |
 |---|---|---|
 | Tiempo límite de grabación | 300 s (5 minutos, 9.600.000 bytes PCM mono a 16 kHz) | `src/main.rs` (bucle de grabación y comprobación de tiempo) |
-| Timeout HTTP del cliente / transcripción / catálogo | 25 s totales (5 s para conexión) | `src/main.rs` (`reqwest::blocking::ClientBuilder`) |
+| Timeout HTTP del cliente / transcripción / catálogo | 120 s totales (5 s para conexión) | `src/main.rs` (`reqwest::blocking::ClientBuilder`) |
 | Tamaño de respuesta JSON | Máximo 2.000.000 bytes | `src/main.rs` |
 | Longitud de transcripción | Máximo 100.000 bytes | `src/main.rs` |
 | Capacidad por keymap chunk | Hasta 10 caracteres únicos por bloque | `src/lib.rs` (`SAFE_EVDEV_KEYS`) |
